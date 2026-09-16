@@ -140,7 +140,8 @@ impl Record {
                 "tables",
             ],
         )?;
-        if value["version"] != 1 || value["scope"] != "isolated_network_namespace" {
+        let current = value["version"] == 2 && value["scope"] == "current_network_namespace";
+        if !current && (value["version"] != 1 || value["scope"] != "isolated_network_namespace") {
             return Err(invalid("Неподдерживаемая версия или область журнала"));
         }
         let boot = value["boot_id"]
@@ -159,17 +160,18 @@ impl Record {
         }
         namespace(&value["pid_namespace"], "pid")?;
         let isolation = &value["isolation"];
-        object(isolation, &["net", "user", "parent_net", "parent_user"])?;
-        for (key, kind) in [
-            ("net", "net"),
-            ("parent_net", "net"),
-            ("user", "user"),
-            ("parent_user", "user"),
-        ] {
-            namespace(&isolation[key], kind)?;
+        let fields: &[&str] = if current {
+            &["net", "user"]
+        } else {
+            &["net", "user", "parent_net", "parent_user"]
+        };
+        object(isolation, fields)?;
+        for key in fields {
+            namespace(&isolation[key], key.strip_prefix("parent_").unwrap_or(key))?;
         }
-        if isolation["net"] == isolation["parent_net"]
-            || isolation["user"] == isolation["parent_user"]
+        if !current
+            && (isolation["net"] == isolation["parent_net"]
+                || isolation["user"] == isolation["parent_user"])
         {
             return Err(invalid(
                 "Журнал не подтверждает создание изолированных namespaces",
@@ -202,6 +204,14 @@ impl Record {
 
     pub fn json(&self) -> Value {
         self.value.clone()
+    }
+
+    pub fn scope(&self) -> &'static str {
+        if self.value["version"] == 1 {
+            "isolated_network_namespace"
+        } else {
+            "current_network_namespace"
+        }
     }
 
     pub fn set_engine(&mut self, pid: u32) -> Result<()> {

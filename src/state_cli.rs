@@ -86,7 +86,5 @@ pub fn run(args: &[&str]) -> Result<Value> {
     }
     result?;
     lease.clear()?;
-    Ok(
-        json!({"state":{"status":"recovered","scope":"isolated_network_namespace","cleanup":"removed"}}),
-    )
+    Ok(json!({"state":{"status":"recovered","scope":record.scope(),"cleanup":"removed"}}))
 }
