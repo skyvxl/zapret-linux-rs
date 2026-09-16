@@ -20,6 +20,11 @@ mod process;
 mod queue_owner;
 mod queue_probe;
 mod runtime;
+mod service_cli;
+mod service_control;
+mod service_fs;
+mod service_install;
+mod service_unit;
 mod signals;
 mod state_cli;
 mod state_dir;
@@ -47,7 +52,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — запуск и диагностика\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N] [--systemd-notify]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N] [--allow-previous-boot]\ndiagnose --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --curl FILE [--targets FILE] [--quic] [--strategy NAME] [--timeout-ms N] [--probe-timeout-ms N] [--ca-file FILE]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\n--help"
+                "zapret-linux-rs — запуск и диагностика\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host [--systemd-notify] --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N] [--allow-previous-boot]\ndiagnose --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --curl FILE [--targets FILE] [--quic] [--strategy NAME] [--timeout-ms N] [--probe-timeout-ms N] [--ca-file FILE]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\nservice install --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE [--root DIR] [--enable] [--start]\nservice uninstall|remove [--stop] [--root DIR]\nservice status [--root DIR]\nservice start|stop|restart|enable|disable\n--help"
             );
             Ok(())
         }
@@ -84,6 +89,10 @@ fn run() -> Result<()> {
         }
         ["firewall", options @ ..] => {
             println!("{}", firewall_cli::run(options)?);
+            Ok(())
+        }
+        ["service", options @ ..] => {
+            println!("{}", service_cli::run(options)?);
             Ok(())
         }
         ["state", options @ ..] => {
