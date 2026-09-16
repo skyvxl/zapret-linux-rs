@@ -237,6 +237,10 @@ impl Record {
         &self.tables
     }
 
+    pub fn previous_boot(&self) -> Result<bool> {
+        Ok(self.value["boot_id"] != boot_id()?)
+    }
+
     pub fn owner_alive(&self) -> Result<bool> {
         if self.value["boot_id"] != boot_id()? || self.value["pid_namespace"] != ns("pid")? {
             return Err(invalid(

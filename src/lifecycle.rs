@@ -4,6 +4,7 @@ use crate::{
     firewall::FirewallPlan,
     host_run, namespace,
     nft::Nft,
+    notify::Notifier,
     output::emit,
     owned_table::OwnedTable,
     process::Managed,
@@ -130,9 +131,15 @@ fn execute<T>(
 ) -> Result<T> {
     let mut values = BTreeMap::new();
     let mut mode = None;
+    let mut systemd_notify = false;
     let mut index = 0;
     while index < options.len() {
         let key = options[index];
+        if key == "--systemd-notify" && !systemd_notify {
+            systemd_notify = true;
+            index += 1;
+            continue;
+        }
         if ["--isolated", "--host"].contains(&key) && mode.is_none() {
             mode = Some(key);
             index += 1;
@@ -172,6 +179,13 @@ fn execute<T>(
         return Err(AppError::new("usage", "Требуется --isolated или --host"));
     }
     let host = mode == Some("--host");
+    if systemd_notify && !host {
+        return Err(AppError::new(
+            "usage",
+            "--systemd-notify допустим только для --host",
+        ));
+    }
+    let notifier = Notifier::from_env(systemd_notify)?;
     let required = |key: &str| {
         values
             .get(key)
@@ -351,8 +365,18 @@ fn execute<T>(
             "queue_num":QUEUE_NUM, "fwmark":FWMARK, "network_validation":"not_run",
             "config":config.json(),"plan":plan.json(true),"engine_binary":binary,"validation":validation,
             "plan_fingerprint":fingerprint,"fingerprint_schema":1,"engine_version":engine_version,"engine_argv":engine_argv});
+        if let Some(notifier) = &notifier {
+            notifier.ready(timeout, &mut || {
+                signals.check()?;
+                queue_probe::alive(&mut child)?;
+                queue_owner::require(child.id())
+            })?;
+        }
         on_ready(&mut child, &ready, run_for, timeout)
     })();
+    if let Some(notifier) = &notifier {
+        notifier.stopping();
+    }
     // Keep nfqws alive while removing rules; aggregate cleanup errors instead of
     // losing the original failure. Retain the journal if cleanup cannot be
     // confirmed; current-network mode cannot rely on namespace destruction.

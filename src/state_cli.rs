@@ -17,6 +17,22 @@ pub fn run(args: &[&str]) -> Result<Value> {
     if !["inspect", "recover"].contains(&mode) {
         return Err(AppError::new("usage", "Неизвестная команда state"));
     }
+    let previous_count = args
+        .iter()
+        .filter(|a| **a == "--allow-previous-boot")
+        .count();
+    if previous_count > 1 || (previous_count != 0 && mode != "recover") {
+        return Err(AppError::new(
+            "usage",
+            "--allow-previous-boot допустим один раз для state recover",
+        ));
+    }
+    let allow_previous_boot = previous_count == 1;
+    let args: Vec<_> = args
+        .iter()
+        .copied()
+        .filter(|a| *a != "--allow-previous-boot")
+        .collect();
     let mut options = BTreeMap::new();
     for pair in args.chunks(2) {
         if pair.len() != 2
@@ -62,7 +78,7 @@ pub fn run(args: &[&str]) -> Result<Value> {
             Some(value) => {
                 let record = Record::parse(value)?;
                 Ok(
-                    json!({"state":{"status":if record.owner_alive()? {"running"} else {"recovery_required"}, "record":record.json()}}),
+                    json!({"state":{"status":if record.previous_boot()? {"previous_boot"} else if record.owner_alive()? {"running"} else {"recovery_required"}, "record":record.json()}}),
                 )
             }
         };
@@ -72,6 +88,27 @@ pub fn run(args: &[&str]) -> Result<Value> {
         return Ok(json!({"state":{"status":"empty","cleanup":"not_needed"}}));
     };
     let record = Record::parse(value)?;
+    if record.previous_boot()? && allow_previous_boot {
+        if record.scope() != "current_network_namespace" {
+            return Err(AppError::new(
+                "state",
+                "Истечение после перезагрузки разрешено только для журнала текущей сети",
+            ));
+        }
+        crate::host_run::context()?;
+        let _network_guard = crate::host_run::lock_network()?;
+        let nft = Nft {
+            binary: nft
+                .as_ref()
+                .ok_or_else(|| AppError::new("usage", "Требуется --nft"))?,
+            timeout: Duration::from_millis(timeout),
+        };
+        require_absent(&nft)?;
+        lease.clear()?;
+        return Ok(
+            json!({"state":{"status":"expired_previous_boot","scope":record.scope(),"cleanup":"not_needed"}}),
+        );
+    }
     record.validate_recovery()?;
     let _network_guard = if record.scope() == "current_network_namespace" {
         crate::host_run::context()?;
@@ -93,4 +130,41 @@ pub fn run(args: &[&str]) -> Result<Value> {
     result?;
     lease.clear()?;
     Ok(json!({"state":{"status":"recovered","scope":record.scope(),"cleanup":"removed"}}))
+}
+
+fn require_absent(nft: &Nft<'_>) -> Result<()> {
+    let entries = nft.list("previous-boot", &["--json", "list", "tables"])?;
+    for entry in entries {
+        let object = entry
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .ok_or_else(|| AppError::new("state", "Неизвестный формат списка таблиц"))?;
+        if let Some(meta) = object.get("metainfo") {
+            if meta.get("json_schema_version") != Some(&json!(1)) {
+                return Err(AppError::new("state", "Неизвестная схема списка таблиц"));
+            }
+            continue;
+        }
+        let table = object
+            .get("table")
+            .and_then(Value::as_object)
+            .ok_or_else(|| AppError::new("state", "Неполный список таблиц"))?;
+        let family = table
+            .get("family")
+            .and_then(Value::as_str)
+            .filter(|s| ["inet", "ip", "ip6", "arp", "bridge", "netdev"].contains(s))
+            .ok_or_else(|| AppError::new("state", "Неизвестное семейство таблицы"))?;
+        let name = table
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AppError::new("state", "Нет имени таблицы"))?;
+        if family == "inet" && ["zapret_rs", "zapret_rs_probe"].contains(&name) {
+            return Err(AppError::new(
+                "state",
+                "После перезагрузки существует таблица zapret_rs; журнал сохранён, удаление запрещено",
+            ));
+        }
+    }
+    Ok(())
 }
