@@ -52,7 +52,7 @@ pub fn run(options: &[&str]) -> Result<Value> {
     if !dry {
         return Err(AppError::new(
             "usage",
-            "На этом этапе поддерживается только run --dry-run",
+            "Укажите явный режим: run --dry-run или run --isolated",
         ));
     }
     // SAFETY: geteuid takes no pointers and has no failure case.

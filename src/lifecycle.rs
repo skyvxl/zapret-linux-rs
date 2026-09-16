@@ -10,6 +10,8 @@ use crate::{
     queue_probe,
     runtime::{FWMARK, QUEUE_NUM},
     signals::Signals,
+    state_dir::StateDir,
+    state_record::Record,
     strategy::Plan,
     validation::{resolve_strategy, validate_command},
 };
@@ -84,6 +86,7 @@ pub fn run(options: &[&str]) -> Result<()> {
             "--nft",
             "--timeout-ms",
             "--run-for-ms",
+            "--state-dir",
         ]
         .contains(&key)
         {
@@ -139,6 +142,18 @@ pub fn run(options: &[&str]) -> Result<()> {
     let firewall = FirewallPlan::new(&config, &plan)?;
     let binary = executable(required("--nfqws")?, "engine")?;
     let nft_binary = executable(required("--nft")?, "firewall")?;
+    let lease = values
+        .get("--state-dir")
+        .map(|path| StateDir::open(Path::new(path))?.lock())
+        .transpose()?;
+    if let Some(lease) = &lease
+        && lease.read()?.is_some()
+    {
+        return Err(AppError::new(
+            "state",
+            "Есть незавершённый журнал; сначала выполните state inspect и восстановление",
+        ));
+    }
     let signals = Signals::install()?;
     let isolation = namespace::enter()?;
     signals.check()?;
@@ -153,11 +168,31 @@ pub fn run(options: &[&str]) -> Result<()> {
     };
     nft.run("check", &["--check", "--file", "-"], &firewall.batch())?;
     signals.check()?;
-    let mut child = Managed::spawn(engine(&binary, &plan))?;
     let table = OwnedTable::new(crate::firewall::TABLE)?;
+    let probe = OwnedTable::new("zapret_rs_probe")?;
+    let mut record = if let Some(lease) = &lease {
+        let record = Record::new(isolation.clone(), &[&table, &probe])?;
+        lease.write(&record.json())?;
+        Some(record)
+    } else {
+        None
+    };
+    let mut child = match Managed::spawn(engine(&binary, &plan)) {
+        Ok(child) => child,
+        Err(error) => {
+            return combine(
+                Err(error),
+                lease.as_ref().map_or(Ok(()), |lease| lease.clear()),
+            );
+        }
+    };
     let mut applied = false;
     let result = (|| {
-        queue_probe::verify(&nft, &mut child, &signals, timeout)?;
+        if let (Some(lease), Some(record)) = (&lease, &mut record) {
+            record.set_engine(child.id())?;
+            lease.write(&record.json())?;
+        }
+        queue_probe::verify(&nft, &mut child, &signals, timeout, &probe)?;
         signals.check()?;
         queue_probe::alive(&mut child)?;
         table.apply(&nft, "apply", &firewall.batch())?;
@@ -187,9 +222,22 @@ pub fn run(options: &[&str]) -> Result<()> {
     })();
     // Keep nfqws alive while removing rules; aggregate cleanup errors instead of
     // losing the original failure. The new namespace contains uncertain results.
-    let cleanup = if applied { table.remove(&nft) } else { Ok(()) };
+    let cleanup = if lease.is_some() {
+        combine(table.remove(&nft), probe.remove(&nft))
+    } else if applied {
+        table.remove(&nft)
+    } else {
+        Ok(())
+    };
+    let cleanup_ok = cleanup.is_ok();
     let stopped = child.stop(timeout.min(Duration::from_millis(1000)));
-    let result = combine(result, cleanup);
+    let mut result = combine(result, cleanup);
+    if cleanup_ok
+        && stopped.is_ok()
+        && let Some(lease) = &lease
+    {
+        result = combine(result, lease.clear());
+    }
     match stopped {
         Ok((output, forced)) => {
             let reason = result?;

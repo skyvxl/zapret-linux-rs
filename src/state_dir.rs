@@ -28,6 +28,9 @@ pub struct Lease {
 
 impl StateDir {
     pub fn open(path: &Path) -> Result<Self> {
+        // Trailing '/' or '/.' would make open follow a final symlink despite
+        // O_NOFOLLOW. Components removes these redundant suffixes first.
+        let path: std::path::PathBuf = path.components().collect();
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)

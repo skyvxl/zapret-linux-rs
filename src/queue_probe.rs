@@ -35,6 +35,7 @@ pub fn verify(
     child: &mut Managed,
     signals: &Signals,
     timeout: Duration,
+    table: &OwnedTable,
 ) -> Result<()> {
     let sender = UdpSocket::bind("127.0.0.1:0").map_err(network_error)?;
     let receiver = UdpSocket::bind("127.0.0.1:0").map_err(network_error)?;
@@ -49,7 +50,6 @@ pub fn verify(
     );
     signals.check()?;
     alive(child)?;
-    let table = OwnedTable::new("zapret_rs_probe")?;
     table.apply(nft, "probe-apply", &batch)?;
     let result = (|| {
         let start = Instant::now();

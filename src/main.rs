@@ -14,6 +14,9 @@ mod process;
 mod queue_probe;
 mod runtime;
 mod signals;
+mod state_cli;
+mod state_dir;
+mod state_record;
 mod strategy;
 mod validation;
 
@@ -37,7 +40,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\n--help"
+                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N]\n--help"
             );
             Ok(())
         }
@@ -74,6 +77,10 @@ fn run() -> Result<()> {
         }
         ["firewall", options @ ..] => {
             println!("{}", firewall_cli::run(options)?);
+            Ok(())
+        }
+        ["state", options @ ..] => {
+            println!("{}", state_cli::run(options)?);
             Ok(())
         }
         ["host", options @ ..] => {

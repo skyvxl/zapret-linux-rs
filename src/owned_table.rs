@@ -2,6 +2,7 @@ use crate::{
     error::{AppError, Result},
     nft::Nft,
 };
+use serde_json::{Value, json};
 use std::{fs::File, io::Read};
 
 pub struct OwnedTable {
@@ -10,6 +11,36 @@ pub struct OwnedTable {
 }
 
 impl OwnedTable {
+    pub fn record(&self) -> Value {
+        json!({"name":self.name,"marker":self.marker})
+    }
+
+    pub fn restore(value: &Value) -> Result<Self> {
+        let name = match value.get("name").and_then(Value::as_str) {
+            Some("zapret_rs") => "zapret_rs",
+            Some("zapret_rs_probe") => "zapret_rs_probe",
+            _ => return Err(AppError::new("state", "Неизвестная таблица в журнале")),
+        };
+        let marker = value
+            .get("marker")
+            .and_then(Value::as_str)
+            .and_then(|text| text.strip_prefix("zapret-linux-rs:"))
+            .filter(|text| {
+                text.len() == 32
+                    && text
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            })
+            .ok_or_else(|| AppError::new("state", "Некорректный маркер таблицы"))?;
+        if value.as_object().is_none_or(|object| object.len() != 2) {
+            return Err(AppError::new("state", "Лишние поля таблицы в журнале"));
+        }
+        Ok(Self {
+            name,
+            marker: format!("zapret-linux-rs:{marker}"),
+        })
+    }
+
     pub fn new(name: &'static str) -> Result<Self> {
         if !["zapret_rs", "zapret_rs_probe"].contains(&name) {
             return Err(AppError::new("firewall", "Неизвестная управляемая таблица"));
