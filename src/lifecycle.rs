@@ -110,12 +110,7 @@ pub fn run(options: &[&str]) -> Result<()> {
             .ok_or_else(|| AppError::new("usage", format!("Требуется {key}")))
     };
     if host {
-        for key in [
-            "--state-dir",
-            "--run-for-ms",
-            "--iptables-save",
-            "--ip6tables-save",
-        ] {
+        for key in ["--state-dir", "--iptables-save", "--ip6tables-save"] {
             required(key)?;
         }
     } else if ["--iptables-save", "--ip6tables-save"]
