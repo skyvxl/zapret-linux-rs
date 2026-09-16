@@ -1,6 +1,7 @@
 use crate::{
     config::Config,
     error::{AppError, Result},
+    runtime::{FWMARK, QUEUE_NUM},
     strategy::Plan,
 };
 use serde_json::{Value, json};
@@ -109,7 +110,7 @@ fn normalized(name: &str) -> String {
         .join("_")
 }
 
-fn resolve_strategy(directory: &Path, name: &str) -> Result<PathBuf> {
+pub fn resolve_strategy(directory: &Path, name: &str) -> Result<PathBuf> {
     let directory = directory
         .canonicalize()
         .map_err(|e| AppError::new("strategy", e.to_string()))?;
@@ -210,7 +211,11 @@ fn drain(pipe: &mut impl Read, output: &mut Vec<u8>, truncated: &mut bool) -> io
 fn validate_engine(binary: &Path, plan: &Plan, timeout: Duration) -> Result<Value> {
     let mut command = Command::new(binary);
     command
-        .args(["--dry-run", "--qnum=220", "--dpi-desync-fwmark=0x40000000"])
+        .args([
+            "--dry-run".to_string(),
+            format!("--qnum={QUEUE_NUM}"),
+            format!("--dpi-desync-fwmark={FWMARK:#x}"),
+        ])
         .args(&plan.args)
         .current_dir(&plan.assets)
         .env_clear()
