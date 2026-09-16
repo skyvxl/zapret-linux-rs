@@ -77,6 +77,7 @@ impl Managed {
 
     fn with_stdin(mut command: Command, stdin: Stdio) -> Result<Self> {
         command
+            .process_group(0)
             .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
