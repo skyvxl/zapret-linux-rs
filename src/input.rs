@@ -1,10 +1,15 @@
 use crate::error::{AppError, Result};
-use std::{fs::File, io::Read, path::Path};
+use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::Path};
 
 pub fn read_text(path: &Path) -> Result<String> {
     const LIMIT: u64 = 1024 * 1024;
-    let file =
-        File::open(path).map_err(|e| AppError::new("io", format!("{}: {e}", path.display())))?;
+    // Open without waiting for a FIFO writer, then check the opened descriptor.
+    // O_NONBLOCK has no effect on regular files.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| AppError::new("io", format!("{}: {e}", path.display())))?;
     if !file
         .metadata()
         .map_err(|e| AppError::new("io", e.to_string()))?

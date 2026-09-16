@@ -60,12 +60,15 @@ impl Plan {
         let mut args = Vec::new();
         let mut count = 0;
         for (group, has_separator) in groups {
-            let transport = group
-                .iter()
-                .find(|token| {
-                    token.starts_with("--filter-tcp=") || token.starts_with("--filter-udp=")
-                })
+            let mut transports = group.iter().filter(|token| {
+                token.starts_with("--filter-tcp=") || token.starts_with("--filter-udp=")
+            });
+            let transport = transports
+                .next()
                 .ok_or_else(|| fail("Профиль должен содержать --filter-tcp или --filter-udp"))?;
+            if transports.next().is_some() {
+                return Err(fail("Поддерживается один транспортный фильтр на профиль"));
+            }
             let raw = transport.split_once('=').unwrap().1;
             let selected_ports = ports(raw, tcp, udp)?;
             if selected_ports.is_empty() {
@@ -109,10 +112,11 @@ impl Plan {
         })
     }
 
-    pub fn json(&self) -> Value {
+    pub fn json(&self, engine_validated: bool) -> Value {
         json!({"args": self.args, "tcp_ports": self.tcp_ports, "udp_ports": self.udp_ports,
             "profile_count": self.profile_count, "assets": self.assets,
-            "engine_validation": "not_run", "network_validation": "not_run"})
+            "engine_validation": if engine_validated { "passed" } else { "not_run" },
+            "network_validation": "not_run"})
     }
 }
 
@@ -271,54 +275,121 @@ fn ports(raw: &str, tcp: bool, udp: bool) -> Result<String> {
     Ok(values.join(","))
 }
 
+// Exact names supported by the nfqws v72.9 importer. Unknown options require
+// explicit classification: getopt abbreviations and future file/process controls
+// must never bypass path validation or change profile boundaries silently.
+const FILE_OPTIONS: &[&str] = &[
+    "--hostlist",
+    "--hostlist-exclude",
+    "--ipset",
+    "--ipset-exclude",
+    "--dpi-desync-split-seqovl-pattern",
+    "--dpi-desync-fakedsplit-pattern",
+    "--dpi-desync-udplen-pattern",
+    "--dpi-desync-fake-http",
+    "--dpi-desync-fake-tls",
+    "--dpi-desync-fake-unknown",
+    "--dpi-desync-fake-syndata",
+    "--dpi-desync-fake-quic",
+    "--dpi-desync-fake-wireguard",
+    "--dpi-desync-fake-dht",
+    "--dpi-desync-fake-discord",
+    "--dpi-desync-fake-stun",
+    "--dpi-desync-fake-unknown-udp",
+];
+
+const SCALAR_OPTIONS: &[&str] = &[
+    "--comment",
+    "--wsize",
+    "--wssize",
+    "--wssize-cutoff",
+    "--wssize-forced-cutoff",
+    "--synack-split",
+    "--ctrack-timeouts",
+    "--ctrack-disable",
+    "--ipcache-lifetime",
+    "--ipcache-hostname",
+    "--hostcase",
+    "--hostspell",
+    "--hostnospace",
+    "--domcase",
+    "--methodeol",
+    "--ip-id",
+    "--dpi-desync",
+    "--dup",
+    "--dup-ttl",
+    "--dup-ttl6",
+    "--dup-autottl",
+    "--dup-autottl6",
+    "--dup-tcp-flags-set",
+    "--dup-tcp-flags-unset",
+    "--dup-fooling",
+    "--dup-ts-increment",
+    "--dup-badseq-increment",
+    "--dup-badack-increment",
+    "--dup-replace",
+    "--dup-ip-id",
+    "--dup-start",
+    "--dup-cutoff",
+    "--orig-ttl",
+    "--orig-ttl6",
+    "--orig-autottl",
+    "--orig-autottl6",
+    "--orig-tcp-flags-set",
+    "--orig-tcp-flags-unset",
+    "--orig-mod-start",
+    "--orig-mod-cutoff",
+    "--dpi-desync-ttl",
+    "--dpi-desync-ttl6",
+    "--dpi-desync-autottl",
+    "--dpi-desync-autottl6",
+    "--dpi-desync-tcp-flags-set",
+    "--dpi-desync-tcp-flags-unset",
+    "--dpi-desync-fooling",
+    "--dpi-desync-repeats",
+    "--dpi-desync-skip-nosni",
+    "--dpi-desync-split-pos",
+    "--dpi-desync-split-http-req",
+    "--dpi-desync-split-tls",
+    "--dpi-desync-split-seqovl",
+    "--dpi-desync-fakedsplit-mod",
+    "--dpi-desync-hostfakesplit-midhost",
+    "--dpi-desync-hostfakesplit-mod",
+    "--dpi-desync-ipfrag-pos-tcp",
+    "--dpi-desync-ipfrag-pos-udp",
+    "--dpi-desync-ts-increment",
+    "--dpi-desync-badseq-increment",
+    "--dpi-desync-badack-increment",
+    "--dpi-desync-any-protocol",
+    "--dpi-desync-fake-tcp-mod",
+    "--dpi-desync-fake-tls-mod",
+    "--dpi-desync-udplen-increment",
+    "--dpi-desync-cutoff",
+    "--dpi-desync-start",
+    "--hostlist-domains",
+    "--hostlist-exclude-domains",
+    "--filter-l3",
+    "--filter-tcp",
+    "--filter-udp",
+    "--filter-l7",
+    "--ipset-ip",
+    "--ipset-exclude-ip",
+    "--bind-fix4",
+    "--bind-fix6",
+];
+
 fn validate_option(token: &str) -> Result<()> {
-    if !token.starts_with("--") {
-        return Err(fail(format!("Ожидается параметр --: {token}")));
-    }
     let key = token.split('=').next().unwrap();
-    // Process control and output files belong to the controller, not the strategy.
-    if [
-        "--daemon",
-        "--qnum",
-        "--pidfile",
-        "--user",
-        "--uid",
-        "--debug",
-        "--dry-run",
-        "--version",
-        "--help",
-        "--dpi-desync-fwmark",
-        "--hostlist-auto",
-        "--hostlist-auto-debug",
-    ]
-    .iter()
-    .any(|reserved| reserved.starts_with(key) && !["--dpi-desync", "--hostlist"].contains(&key))
-        || key.starts_with("--hostlist-auto")
-    {
+    if !is_file_option(key) && !SCALAR_OPTIONS.contains(&key) {
         return Err(fail(format!(
-            "Управляющий или записывающий параметр запрещён: {key}"
+            "Неподдерживаемый параметр: {key}; нужны полные имена поддержанных параметров nfqws, без управления процессом или профилями"
         )));
-    }
-    if !key[2..]
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || c == b'-')
-        || key.len() == 2
-    {
-        return Err(fail("Некорректное имя параметра"));
     }
     Ok(())
 }
 
 fn is_file_option(key: &str) -> bool {
-    [
-        "--hostlist",
-        "--hostlist-exclude",
-        "--ipset",
-        "--ipset-exclude",
-        "--dpi-desync-split-seqovl-pattern",
-    ]
-    .contains(&key)
-        || (key.starts_with("--dpi-desync-fake-") && !key.ends_with("-mod"))
+    FILE_OPTIONS.contains(&key)
 }
 
 fn asset_value(key: &str, value: &str, assets: &Path) -> Result<String> {

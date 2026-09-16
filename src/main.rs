@@ -2,6 +2,7 @@ mod config;
 mod error;
 mod input;
 mod strategy;
+mod validation;
 
 use error::{AppError, Result};
 use serde_json::json;
@@ -23,7 +24,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\n--help"
+                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\n--help"
             );
             Ok(())
         }
@@ -48,7 +49,11 @@ fn run() -> Result<()> {
                 }
             }
             let plan = strategy::Plan::load(Path::new(file), Path::new(assets), tcp, udp)?;
-            println!("{}", json!({"plan": plan.json()}));
+            println!("{}", json!({"plan": plan.json(false)}));
+            Ok(())
+        }
+        ["run", options @ ..] => {
+            println!("{}", validation::run(options)?);
             Ok(())
         }
         _ => Err(AppError::new(
