@@ -151,14 +151,14 @@ if [[ ${1:-} == deps ]]; then
     esac
 fi
 
-if ! /bin/bash "$bootstrap" --check; then
+if ! /bin/bash "$bootstrap" --check >&2; then
     if [[ -t 0 ]]; then
         printf 'Подготовить недостающие зависимости сейчас? [y/N] ' >&2
         answer=
         IFS= read -r answer || answer=
         case $answer in
             y|Y|yes|YES|да|Да|ДА)
-                /bin/bash "$bootstrap" --install || exit $?
+                /bin/bash "$bootstrap" --install >&2 || exit $?
                 ;;
             *)
                 printf 'Установка отменена. Запустите: %s deps --install\n' "$launcher" >&2

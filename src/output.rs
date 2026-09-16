@@ -10,6 +10,53 @@ use std::{
     time::{Duration, Instant},
 };
 
+thread_local! { static HUMAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+/// Explicit worker-only presentation; no environment-driven legacy changes.
+pub struct Human(bool);
+impl Human {
+    pub fn enter() -> Self {
+        Self(HUMAN.replace(true))
+    }
+}
+impl Drop for Human {
+    fn drop(&mut self) {
+        HUMAN.set(self.0);
+    }
+}
+
+fn render(value: &Value) -> String {
+    let text = |key: &str| value[key].as_str().unwrap_or("unknown");
+    match value["event"].as_str() {
+        Some("ready") => format!(
+            "Запущено: {}. Очередь и firewall проверены. Для остановки Ctrl+C.\n",
+            value["config"]["strategy"].as_str().unwrap_or("unknown")
+        ),
+        Some("stopped") if value["cleanup"] == "removed" => {
+            "Остановлено: правила удалены, процесс завершён, очистка подтверждена.\n".into()
+        }
+        Some("diagnosis_started") => format!(
+            "Начата диагностика {} стратегий.\n",
+            value["strategy_order"].as_array().map_or(0, Vec::len)
+        ),
+        Some("strategy_ready") => format!("Проверяется: {}\n", text("strategy")),
+        Some("strategy_complete") => format!(
+            "{}: {} (очистка: {})\n",
+            value["result"]["strategy"],
+            value["result"]["status"],
+            value["result"]["cleanup_confirmed"]
+        ),
+        Some("diagnosis_complete") => format!(
+            "Диагностика: {}. TCP прошли: {}. QUIC прошли: {}.\nПроверена HTTP-доступность; воспроизведение видео и голос не проверялись.\n",
+            value["report"]["status"],
+            value["report"]["tcp_passed"],
+            value["report"]["quic_passed"]
+        ),
+        Some("probe_result") => format!("{}: {}\n", text("strategy"), value["result"]),
+        _ => format!("{value}\n"),
+    }
+}
+
 struct Flags {
     fd: libc::c_int,
     original: libc::c_int,
@@ -28,7 +75,11 @@ pub fn emit(value: Value, signals: &Signals, timeout: Duration, interruptible: b
     let stdout = io::stdout().lock();
     write(
         stdout.as_raw_fd(),
-        &format!("{value}\n"),
+        &if HUMAN.get() {
+            render(&value)
+        } else {
+            format!("{value}\n")
+        },
         "stdout",
         signals,
         timeout,

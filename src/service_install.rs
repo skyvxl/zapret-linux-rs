@@ -775,7 +775,7 @@ fn report(
     runtime: Option<&Status>,
     enabled: bool,
 ) -> Value {
-    json!({"service":{"status":status,"deployment":layout.deployment(),"owned":manifest.is_some(),"installation_id":manifest.map(|m|&m["installation_id"]),"enabled":enabled,"runtime":runtime.map(|r|json!(r.get("ActiveState"))).unwrap_or(json!("not_queried")),"manager":runtime.map(Status::json)}})
+    json!({"service":{"status":status,"deployment":layout.deployment(),"owned":manifest.is_some(),"installation_id":manifest.map(|m|&m["installation_id"]),"strategy":manifest.map(|m|&m["sources"]["strategy_name"]),"enabled":enabled,"runtime":runtime.map(|r|json!(r.get("ActiveState"))).unwrap_or(json!("not_queried")),"manager":runtime.map(Status::json)}})
 }
 fn activate(o: &Options, manager: Option<&Manager>) -> Result<Option<Status>> {
     let Some(m) = manager else {
