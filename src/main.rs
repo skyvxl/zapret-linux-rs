@@ -1,4 +1,6 @@
 mod config;
+mod diagnostic_http;
+mod diagnostic_targets;
 mod error;
 mod firewall;
 mod firewall_cli;
@@ -11,6 +13,7 @@ mod namespace;
 mod nft;
 mod output;
 mod owned_table;
+mod probe_cli;
 mod process;
 mod queue_owner;
 mod queue_probe;
@@ -42,7 +45,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --run-for-ms N [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N]\n--help"
+                "zapret-linux-rs — запуск и диагностика\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\n--help"
             );
             Ok(())
         }
@@ -83,6 +86,10 @@ fn run() -> Result<()> {
         }
         ["state", options @ ..] => {
             println!("{}", state_cli::run(options)?);
+            Ok(())
+        }
+        ["probe", options @ ..] => {
+            println!("{}", probe_cli::run(options)?);
             Ok(())
         }
         ["host", options @ ..] => {
