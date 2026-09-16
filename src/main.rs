@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod input;
+mod strategy;
 
 use error::{AppError, Result};
 use serde_json::json;
@@ -21,12 +22,33 @@ fn run() -> Result<()> {
         .as_slice()
     {
         ["--help"] | ["-h"] => {
-            println!("zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\n--help");
+            println!(
+                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\n--help"
+            );
             Ok(())
         }
         ["config", "validate", file] => {
             let config = config::Config::load(Path::new(file))?;
             println!("{}", json!({"config": config.json()}));
+            Ok(())
+        }
+        ["strategy", "explain", file, "--assets", assets, flags @ ..] => {
+            let mut tcp = false;
+            let mut udp = false;
+            for flag in flags {
+                match *flag {
+                    "-gt" | "--gamefilter-tcp" if !tcp => tcp = true,
+                    "-gu" | "--gamefilter-udp" if !udp => udp = true,
+                    _ => {
+                        return Err(AppError::new(
+                            "usage",
+                            "Неизвестный или повторный флаг GameFilter",
+                        ));
+                    }
+                }
+            }
+            let plan = strategy::Plan::load(Path::new(file), Path::new(assets), tcp, udp)?;
+            println!("{}", json!({"plan": plan.json()}));
             Ok(())
         }
         _ => Err(AppError::new(
