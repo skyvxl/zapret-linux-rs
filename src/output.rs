@@ -26,7 +26,29 @@ impl Drop for Flags {
 
 pub fn emit(value: Value, signals: &Signals, timeout: Duration, interruptible: bool) -> Result<()> {
     let stdout = io::stdout().lock();
-    let fd = stdout.as_raw_fd();
+    write(
+        stdout.as_raw_fd(),
+        &format!("{value}\n"),
+        "stdout",
+        signals,
+        timeout,
+        interruptible,
+    )
+}
+
+pub fn stderr(text: &str, signals: &Signals, timeout: Duration) -> Result<()> {
+    let stderr = io::stderr().lock();
+    write(stderr.as_raw_fd(), text, "stderr", signals, timeout, false)
+}
+
+fn write(
+    fd: libc::c_int,
+    text: &str,
+    name: &str,
+    signals: &Signals,
+    timeout: Duration,
+    interruptible: bool,
+) -> Result<()> {
     // SAFETY: valid locked stdout descriptor; fcntl uses scalar arguments.
     let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if original < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, original | libc::O_NONBLOCK) } < 0 {
@@ -36,18 +58,20 @@ pub fn emit(value: Value, signals: &Signals, timeout: Duration, interruptible: b
         ));
     }
     let _restore = Flags { fd, original };
-    let bytes = format!("{value}\n").into_bytes();
+    let bytes = text.as_bytes();
     let mut sent = 0;
     let start = Instant::now();
     while sent < bytes.len() {
-        if interruptible {
+        // Finish a started JSON record even if interrupted, within the same
+        // bounded timeout. Otherwise the next report would append to half a line.
+        if interruptible && sent == 0 {
             signals.check()?;
         }
         if start.elapsed() >= timeout {
             return Err(AppError::new(
                 "timeout",
                 format!(
-                    "stdout: вывод заблокирован более {} мс",
+                    "{name}: вывод заблокирован более {} мс",
                     timeout.as_millis()
                 ),
             ));
@@ -60,7 +84,7 @@ pub fn emit(value: Value, signals: &Signals, timeout: Duration, interruptible: b
             continue;
         }
         if count == 0 {
-            return Err(AppError::new("output", "stdout: запись вернула 0"));
+            return Err(AppError::new("output", format!("{name}: запись вернула 0")));
         }
         let error = io::Error::last_os_error();
         if !matches!(

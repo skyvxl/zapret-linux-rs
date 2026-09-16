@@ -16,6 +16,7 @@ use crate::{
     validation::{resolve_strategy, validate_command},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     os::unix::process::CommandExt,
@@ -321,12 +322,35 @@ fn execute<T>(
         if host {
             queue_owner::require(child.id())?;
         }
+        let engine_version = validation["stdout"].as_str().and_then(|out| {
+            out.lines().find(|line| {
+                [
+                    "github version ",
+                    "github android version ",
+                    "self-built version ",
+                    "self-built android version ",
+                ]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+            })
+        });
+        let engine_argv: Vec<_> = engine(&binary, &plan)
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let identity = json!({"version":1,"config":config.json(),"plan":plan.json(true),"strategy_file":file,
+            "engine_binary":binary,"engine_version":engine_version,"engine_argv":engine_argv});
+        let fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(identity.to_string().as_bytes())
+        );
         let ready = json!({"event":"ready", "scope":scope, "isolation":isolation,
             "run_for_ms":run_for.map(|duration|duration.as_millis()),"duration_starts_after_ready":true,
             "queue_ownership":if host {"exclusive_child_netfilter_sockets"} else {"not_inspected"},
             "readiness":"queue_packet_roundtrip", "engine_pid":child.id(), "strategy_file":file,
             "queue_num":QUEUE_NUM, "fwmark":FWMARK, "network_validation":"not_run",
-            "config":config.json(),"plan":plan.json(true),"engine_binary":binary,"validation":validation});
+            "config":config.json(),"plan":plan.json(true),"engine_binary":binary,"validation":validation,
+            "plan_fingerprint":fingerprint,"fingerprint_schema":1,"engine_version":engine_version,"engine_argv":engine_argv});
         on_ready(&mut child, &ready, run_for, timeout)
     })();
     // Keep nfqws alive while removing rules; aggregate cleanup errors instead of
