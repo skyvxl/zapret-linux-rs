@@ -36,6 +36,7 @@ pub fn verify(
     signals: &Signals,
     timeout: Duration,
     table: &OwnedTable,
+    verify_owner: bool,
 ) -> Result<()> {
     let sender = UdpSocket::bind("127.0.0.1:0").map_err(network_error)?;
     let receiver = UdpSocket::bind("127.0.0.1:0").map_err(network_error)?;
@@ -58,6 +59,9 @@ pub fn verify(
         loop {
             signals.check()?;
             alive(child)?;
+            if verify_owner {
+                crate::queue_owner::require(child.id())?;
+            }
             // With no listener the kernel can return EPERM/ECONNREFUSED.
             // Retry within the deadline while nfqws is still starting.
             if let Err(error) = sender.send_to(payload, target)
@@ -77,6 +81,9 @@ pub fn verify(
             match receiver.recv_from(&mut buffer) {
                 Ok((count, peer)) if peer == source && buffer[..count] == payload[..] => {
                     alive(child)?;
+                    if verify_owner {
+                        crate::queue_owner::require(child.id())?;
+                    }
                     return Ok(());
                 }
                 Ok(_) => {}

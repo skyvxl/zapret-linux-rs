@@ -116,14 +116,25 @@ pub struct Record {
 
 impl Record {
     pub fn new(isolation: Value, tables: &[&OwnedTable]) -> Result<Self> {
+        Self::capture(isolation, tables, 1, "isolated_network_namespace")
+    }
+
+    pub fn new_current(isolation: Value, tables: &[&OwnedTable]) -> Result<Self> {
+        Self::capture(isolation, tables, 2, "current_network_namespace")
+    }
+
+    fn capture(
+        isolation: Value,
+        tables: &[&OwnedTable],
+        version: u32,
+        scope: &str,
+    ) -> Result<Self> {
         check_procfs()?;
         let (owner, _) =
             Identity::read(std::process::id())?.ok_or_else(|| invalid("Нет текущего процесса"))?;
-        Self::parse(
-            json!({"version":1,"scope":"isolated_network_namespace","boot_id":boot_id()?,
+        Self::parse(json!({"version":version,"scope":scope,"boot_id":boot_id()?,
             "pid_namespace":ns("pid")?,"owner":owner.json(),"engine":null,"isolation":isolation,
-            "tables":tables.iter().map(|table|table.record()).collect::<Vec<_>>()}),
-        )
+            "tables":tables.iter().map(|table|table.record()).collect::<Vec<_>>()}))
     }
 
     pub fn parse(value: Value) -> Result<Self> {

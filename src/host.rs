@@ -75,7 +75,8 @@ pub fn run(args: &[&str]) -> Result<Value> {
         "complete": complete,
         "scope": "current_network_namespace",
         "namespaces": {"net": net, "user": user},
-        "host_run_available": false,
+        "host_run_supported": true,
+        "inspection_authorizes_run": false,
         "queue": QUEUE,
         "nft": nft,
         "processes": processes,
@@ -269,7 +270,7 @@ fn nft_failure(status: &str, diagnostic: &str) -> Value {
     json!({"status": status, "complete": false, "known_tables": [], "queues": [], "diagnostic": diagnostic})
 }
 
-fn inspect_nft(binary: &Path, timeout: Duration) -> Value {
+pub(crate) fn inspect_nft(binary: &Path, timeout: Duration) -> Value {
     let Ok(binary) = binary.canonicalize() else {
         return nft_failure("unavailable", "Cannot resolve the explicit nft executable");
     };

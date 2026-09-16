@@ -2,12 +2,12 @@ use crate::{
     config::Config,
     error::{AppError, Result, combine},
     firewall::FirewallPlan,
-    namespace,
+    host_run, namespace,
     nft::Nft,
     output::emit,
     owned_table::OwnedTable,
     process::Managed,
-    queue_probe,
+    queue_owner, queue_probe,
     runtime::{FWMARK, QUEUE_NUM},
     signals::Signals,
     state_dir::StateDir,
@@ -18,7 +18,6 @@ use crate::{
 use serde_json::json;
 use std::{
     collections::BTreeMap,
-    io,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
@@ -50,31 +49,23 @@ fn engine(binary: &Path, plan: &Plan) -> Command {
         .current_dir(&plan.assets)
         .env_clear()
         .env("LANG", "C");
-    // SAFETY: scalar prctl calls only, before exec. In our single-UID user
-    // namespace setgroups is denied. Removing these bounding capabilities makes
-    // nfqws skip its automatic UID/GID switch; it still drops other capabilities.
+    // SAFETY: stack-only syscalls before exec. Prevent nfqws's UID/GID switch
+    // (including inherited capabilities) so it retains the parent-death signal
+    // installed by Managed after this hook. nfqws drops other capabilities.
     unsafe {
-        command.pre_exec(|| {
-            for capability in [6, 7] {
-                // CAP_SETGID, CAP_SETUID
-                if libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        });
+        command.pre_exec(host_run::restrict_child_ids);
     }
     command
 }
 
 pub fn run(options: &[&str]) -> Result<()> {
     let mut values = BTreeMap::new();
-    let mut isolated = false;
+    let mut mode = None;
     let mut index = 0;
     while index < options.len() {
         let key = options[index];
-        if key == "--isolated" && !isolated {
-            isolated = true;
+        if ["--isolated", "--host"].contains(&key) && mode.is_none() {
+            mode = Some(key);
             index += 1;
             continue;
         }
@@ -87,6 +78,8 @@ pub fn run(options: &[&str]) -> Result<()> {
             "--timeout-ms",
             "--run-for-ms",
             "--state-dir",
+            "--iptables-save",
+            "--ip6tables-save",
         ]
         .contains(&key)
         {
@@ -106,15 +99,34 @@ pub fn run(options: &[&str]) -> Result<()> {
         }
         index += 2;
     }
-    if !isolated {
-        return Err(AppError::new("usage", "Требуется --isolated"));
+    if mode.is_none() {
+        return Err(AppError::new("usage", "Требуется --isolated или --host"));
     }
+    let host = mode == Some("--host");
     let required = |key: &str| {
         values
             .get(key)
             .copied()
             .ok_or_else(|| AppError::new("usage", format!("Требуется {key}")))
     };
+    if host {
+        for key in [
+            "--state-dir",
+            "--run-for-ms",
+            "--iptables-save",
+            "--ip6tables-save",
+        ] {
+            required(key)?;
+        }
+    } else if ["--iptables-save", "--ip6tables-save"]
+        .iter()
+        .any(|key| values.contains_key(key))
+    {
+        return Err(AppError::new(
+            "usage",
+            "Параметры legacy-save допустимы только для --host",
+        ));
+    }
     let duration = |key: &str, value: &str| {
         value
             .parse::<u64>()
@@ -142,6 +154,25 @@ pub fn run(options: &[&str]) -> Result<()> {
     let firewall = FirewallPlan::new(&config, &plan)?;
     let binary = executable(required("--nfqws")?, "engine")?;
     let nft_binary = executable(required("--nft")?, "firewall")?;
+    let legacy = if host {
+        Some((
+            executable(required("--iptables-save")?, "preflight")?,
+            executable(required("--ip6tables-save")?, "preflight")?,
+        ))
+    } else {
+        None
+    };
+    let current = if host {
+        host_run::check_interface(&config.interface)?;
+        Some(host_run::context()?)
+    } else {
+        None
+    };
+    let _network_guard = if host {
+        Some(host_run::lock_network()?)
+    } else {
+        None
+    };
     let lease = values
         .get("--state-dir")
         .map(|path| StateDir::open(Path::new(path))?.lock())
@@ -155,9 +186,23 @@ pub fn run(options: &[&str]) -> Result<()> {
         ));
     }
     let signals = Signals::install()?;
-    let isolation = namespace::enter()?;
+    let isolation = match current {
+        Some(context) => context,
+        None => namespace::enter()?,
+    };
+    let scope = if host {
+        "current_network_namespace"
+    } else {
+        "isolated_network_namespace"
+    };
     signals.check()?;
-    namespace::loopback_up()?;
+    if !host {
+        namespace::loopback_up()?;
+    }
+    if let Some((ipv4, ipv6)) = &legacy {
+        host_run::preflight(&nft_binary, ipv4, ipv6, timeout)?;
+        signals.check()?;
+    }
     let mut dry = engine(&binary, &plan);
     dry.arg("--dry-run");
     validate_command(dry, timeout)?;
@@ -171,7 +216,11 @@ pub fn run(options: &[&str]) -> Result<()> {
     let table = OwnedTable::new(crate::firewall::TABLE)?;
     let probe = OwnedTable::new("zapret_rs_probe")?;
     let mut record = if let Some(lease) = &lease {
-        let record = Record::new(isolation.clone(), &[&table, &probe])?;
+        let record = if host {
+            Record::new_current(isolation.clone(), &[&table, &probe])?
+        } else {
+            Record::new(isolation.clone(), &[&table, &probe])?
+        };
         lease.write(&record.json())?;
         Some(record)
     } else {
@@ -192,16 +241,27 @@ pub fn run(options: &[&str]) -> Result<()> {
             record.set_engine(child.id())?;
             lease.write(&record.json())?;
         }
-        queue_probe::verify(&nft, &mut child, &signals, timeout, &probe)?;
+        if host {
+            queue_owner::wait(&mut child, &signals, timeout)?;
+        }
+        queue_probe::verify(&nft, &mut child, &signals, timeout, &probe, host)?;
         signals.check()?;
         queue_probe::alive(&mut child)?;
+        if host {
+            queue_owner::require(child.id())?;
+        }
         table.apply(&nft, "apply", &firewall.batch())?;
         applied = true;
         nft.inspect(&firewall)?;
         signals.check()?;
         queue_probe::alive(&mut child)?;
+        if host {
+            queue_owner::require(child.id())?;
+        }
         emit(
-            json!({"event":"ready", "scope":"isolated_network_namespace", "isolation":isolation,
+            json!({"event":"ready", "scope":scope, "isolation":isolation,
+            "run_for_ms":run_for.map(|duration|duration.as_millis()),"duration_starts_after_ready":true,
+            "queue_ownership":if host {"exclusive_child_netfilter_sockets"} else {"not_inspected"},
             "readiness":"queue_packet_roundtrip", "engine_pid":child.id(), "strategy_file":file,
             "queue_num":QUEUE_NUM, "fwmark":FWMARK, "network_validation":"not_run"}),
             &signals,
@@ -221,7 +281,8 @@ pub fn run(options: &[&str]) -> Result<()> {
         }
     })();
     // Keep nfqws alive while removing rules; aggregate cleanup errors instead of
-    // losing the original failure. The new namespace contains uncertain results.
+    // losing the original failure. Retain the journal if cleanup cannot be
+    // confirmed; current-network mode cannot rely on namespace destruction.
     let cleanup = if lease.is_some() {
         combine(table.remove(&nft), probe.remove(&nft))
     } else if applied {
@@ -242,7 +303,7 @@ pub fn run(options: &[&str]) -> Result<()> {
         Ok((output, forced)) => {
             let reason = result?;
             emit(
-                json!({"event":"stopped", "scope":"isolated_network_namespace", "reason":reason,
+                json!({"event":"stopped", "scope":scope, "reason":reason,
                 "cleanup":"removed", "engine_forced_kill":forced, "engine_exit_code":output.status.code(),
                 "stdout":output.stdout, "stderr":output.stderr, "output_truncated":output.truncated}),
                 &signals,

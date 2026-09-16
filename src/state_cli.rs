@@ -73,6 +73,12 @@ pub fn run(args: &[&str]) -> Result<Value> {
     };
     let record = Record::parse(value)?;
     record.validate_recovery()?;
+    let _network_guard = if record.scope() == "current_network_namespace" {
+        crate::host_run::context()?;
+        Some(crate::host_run::lock_network()?)
+    } else {
+        None
+    };
     let binary = nft
         .as_ref()
         .ok_or_else(|| AppError::new("usage", "Требуется --nft"))?;
