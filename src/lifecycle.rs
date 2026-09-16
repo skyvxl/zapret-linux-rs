@@ -15,7 +15,7 @@ use crate::{
     strategy::Plan,
     validation::{resolve_strategy, validate_command},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     os::unix::process::CommandExt,
@@ -58,7 +58,75 @@ fn engine(binary: &Path, plan: &Plan) -> Command {
     command
 }
 
+pub struct Outcome<T> {
+    pub result: Result<T>,
+    pub cleanup_confirmed: bool,
+    pub stopped: Option<Value>,
+}
+
 pub fn run(options: &[&str]) -> Result<()> {
+    let signals = Signals::install()?;
+    let mut timeout = Duration::from_millis(5000);
+    let outcome = supervise(
+        options,
+        None,
+        &signals,
+        |child, ready, run_for, operation_timeout| {
+            timeout = operation_timeout;
+            emit(ready.clone(), &signals, timeout, true)?;
+            let start = Instant::now();
+            loop {
+                queue_probe::alive(child)?;
+                if let Some(signal) = signals.requested() {
+                    return Ok(signal);
+                }
+                if run_for.is_some_and(|limit| start.elapsed() >= limit) {
+                    return Ok("duration");
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        },
+    );
+    debug_assert!(outcome.result.is_err() || outcome.cleanup_confirmed);
+    let reason = outcome.result?;
+    if let Some(mut stopped) = outcome.stopped {
+        stopped["reason"] = json!(reason);
+        emit(stopped, &signals, timeout, false)?;
+    }
+    Ok(())
+}
+
+pub fn supervise<T>(
+    options: &[&str],
+    strategy_override: Option<&str>,
+    signals: &Signals,
+    on_ready: impl FnOnce(&mut Managed, &Value, Option<Duration>, Duration) -> Result<T>,
+) -> Outcome<T> {
+    let mut cleanup_confirmed = true;
+    let mut stopped_event = None;
+    let result = execute(
+        options,
+        strategy_override,
+        signals,
+        on_ready,
+        &mut cleanup_confirmed,
+        &mut stopped_event,
+    );
+    Outcome {
+        result,
+        cleanup_confirmed,
+        stopped: stopped_event,
+    }
+}
+
+fn execute<T>(
+    options: &[&str],
+    strategy_override: Option<&str>,
+    signals: &Signals,
+    on_ready: impl FnOnce(&mut Managed, &Value, Option<Duration>, Duration) -> Result<T>,
+    cleanup_confirmed: &mut bool,
+    stopped_event: &mut Option<Value>,
+) -> Result<T> {
     let mut values = BTreeMap::new();
     let mut mode = None;
     let mut index = 0;
@@ -138,7 +206,10 @@ pub fn run(options: &[&str]) -> Result<()> {
         .get("--run-for-ms")
         .map(|value| duration("--run-for-ms", value))
         .transpose()?;
-    let config = Config::load(Path::new(required("--config")?))?;
+    let mut config = Config::load(Path::new(required("--config")?))?;
+    if let Some(name) = strategy_override {
+        config.strategy = name.to_string();
+    }
     let file = resolve_strategy(Path::new(required("--strategies")?), &config.strategy)?;
     let plan = Plan::load(
         &file,
@@ -180,7 +251,6 @@ pub fn run(options: &[&str]) -> Result<()> {
             "Есть незавершённый журнал; сначала выполните state inspect и восстановление",
         ));
     }
-    let signals = Signals::install()?;
     let isolation = match current {
         Some(context) => context,
         None => namespace::enter()?,
@@ -200,7 +270,7 @@ pub fn run(options: &[&str]) -> Result<()> {
     }
     let mut dry = engine(&binary, &plan);
     dry.arg("--dry-run");
-    validate_command(dry, timeout)?;
+    let validation = validate_command(dry, timeout)?;
     signals.check()?;
     let nft = Nft {
         binary: &nft_binary,
@@ -210,6 +280,7 @@ pub fn run(options: &[&str]) -> Result<()> {
     signals.check()?;
     let table = OwnedTable::new(crate::firewall::TABLE)?;
     let probe = OwnedTable::new("zapret_rs_probe")?;
+    *cleanup_confirmed = false;
     let mut record = if let Some(lease) = &lease {
         let record = if host {
             Record::new_current(isolation.clone(), &[&table, &probe])?
@@ -224,88 +295,62 @@ pub fn run(options: &[&str]) -> Result<()> {
     let mut child = match Managed::spawn(engine(&binary, &plan)) {
         Ok(child) => child,
         Err(error) => {
-            return combine(
-                Err(error),
-                lease.as_ref().map_or(Ok(()), |lease| lease.clear()),
-            );
+            let cleanup = lease.as_ref().map_or(Ok(()), |lease| lease.clear());
+            *cleanup_confirmed = cleanup.is_ok();
+            return combine(Err(error), cleanup);
         }
     };
-    let mut applied = false;
     let result = (|| {
         if let (Some(lease), Some(record)) = (&lease, &mut record) {
             record.set_engine(child.id())?;
             lease.write(&record.json())?;
         }
         if host {
-            queue_owner::wait(&mut child, &signals, timeout)?;
+            queue_owner::wait(&mut child, signals, timeout)?;
         }
-        queue_probe::verify(&nft, &mut child, &signals, timeout, &probe, host)?;
+        queue_probe::verify(&nft, &mut child, signals, timeout, &probe, host)?;
         signals.check()?;
         queue_probe::alive(&mut child)?;
         if host {
             queue_owner::require(child.id())?;
         }
         table.apply(&nft, "apply", &firewall.batch())?;
-        applied = true;
         nft.inspect(&firewall)?;
         signals.check()?;
         queue_probe::alive(&mut child)?;
         if host {
             queue_owner::require(child.id())?;
         }
-        emit(
-            json!({"event":"ready", "scope":scope, "isolation":isolation,
+        let ready = json!({"event":"ready", "scope":scope, "isolation":isolation,
             "run_for_ms":run_for.map(|duration|duration.as_millis()),"duration_starts_after_ready":true,
             "queue_ownership":if host {"exclusive_child_netfilter_sockets"} else {"not_inspected"},
             "readiness":"queue_packet_roundtrip", "engine_pid":child.id(), "strategy_file":file,
-            "queue_num":QUEUE_NUM, "fwmark":FWMARK, "network_validation":"not_run"}),
-            &signals,
-            timeout,
-            true,
-        )?;
-        let start = Instant::now();
-        loop {
-            queue_probe::alive(&mut child)?;
-            if let Some(signal) = signals.requested() {
-                return Ok(signal);
-            }
-            if run_for.is_some_and(|limit| start.elapsed() >= limit) {
-                return Ok("duration");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+            "queue_num":QUEUE_NUM, "fwmark":FWMARK, "network_validation":"not_run",
+            "config":config.json(),"plan":plan.json(true),"engine_binary":binary,"validation":validation});
+        on_ready(&mut child, &ready, run_for, timeout)
     })();
     // Keep nfqws alive while removing rules; aggregate cleanup errors instead of
     // losing the original failure. Retain the journal if cleanup cannot be
     // confirmed; current-network mode cannot rely on namespace destruction.
-    let cleanup = if lease.is_some() {
-        combine(table.remove(&nft), probe.remove(&nft))
-    } else if applied {
-        table.remove(&nft)
-    } else {
-        Ok(())
-    };
-    let cleanup_ok = cleanup.is_ok();
+    let cleanup = combine(table.remove(&nft), probe.remove(&nft));
     let stopped = child.stop(timeout.min(Duration::from_millis(1000)));
-    let mut result = combine(result, cleanup);
-    if cleanup_ok
+    let mut cleanup = cleanup;
+    if cleanup.is_ok()
         && stopped.is_ok()
         && let Some(lease) = &lease
     {
-        result = combine(result, lease.clear());
+        cleanup = lease.clear();
     }
+    *cleanup_confirmed = cleanup.is_ok() && stopped.is_ok();
+    let result = combine(result, cleanup);
     match stopped {
         Ok((output, forced)) => {
-            let reason = result?;
-            emit(
-                json!({"event":"stopped", "scope":scope, "reason":reason,
-                "cleanup":"removed", "engine_forced_kill":forced, "engine_exit_code":output.status.code(),
-                "stdout":output.stdout, "stderr":output.stderr, "output_truncated":output.truncated}),
-                &signals,
-                timeout,
-                false,
-            )
+            *stopped_event = Some(json!({"event":"stopped", "scope":scope,
+                "cleanup":if *cleanup_confirmed {"removed"} else {"failed"},
+                "engine_forced_kill":forced, "engine_exit_code":output.status.code(),
+                "stdout":output.stdout, "stderr":output.stderr, "output_truncated":output.truncated}));
+            result
         }
-        Err(error) => combine(result, Err(error)).map(|_| ()),
+        Err(error) => combine(result, Err(error)),
     }
 }
