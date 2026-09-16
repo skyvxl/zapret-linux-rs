@@ -1,3 +1,7 @@
+mod app_arch;
+mod app_archive;
+mod app_paths;
+mod app_setup;
 mod config;
 mod diagnose;
 mod diagnostic_http;
@@ -52,7 +56,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — запуск и диагностика\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host [--systemd-notify] --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N] [--allow-previous-boot]\ndiagnose --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --curl FILE [--targets FILE] [--quic] [--strategy NAME] [--timeout-ms N] [--probe-timeout-ms N] [--ca-file FILE]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\nservice install --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE [--root DIR] [--enable] [--start]\nservice uninstall|remove [--stop] [--root DIR]\nservice status [--root DIR]\nservice start|stop|restart|enable|disable\n--help"
+                "zapret-linux-rs — запуск и диагностика\n\nui setup [--archive-dir DIR] [--json]\nui doctor [--json]\nui paths\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host [--systemd-notify] --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N] [--allow-previous-boot]\ndiagnose --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --curl FILE [--targets FILE] [--quic] [--strategy NAME] [--timeout-ms N] [--probe-timeout-ms N] [--ca-file FILE]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\nservice install --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE [--root DIR] [--enable] [--start]\nservice uninstall|remove [--stop] [--root DIR]\nservice status [--root DIR]\nservice start|stop|restart|enable|disable\n--help"
             );
             Ok(())
         }
@@ -106,6 +110,10 @@ fn run() -> Result<()> {
         }
         ["host", options @ ..] => {
             println!("{}", host::run(options)?);
+            Ok(())
+        }
+        ["ui", options @ ..] => {
+            println!("{}", app_setup::ui(options)?);
             Ok(())
         }
         _ => Err(AppError::new(
