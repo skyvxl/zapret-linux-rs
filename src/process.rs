@@ -2,7 +2,7 @@ use crate::error::{AppError, Result};
 use std::{
     io::{self, Read, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -57,50 +57,148 @@ fn drain(pipe: &mut impl Read, output: &mut Vec<u8>, truncated: &mut bool) -> io
     Ok(())
 }
 
-pub fn capture(mut command: Command, input: &[u8], timeout: Duration) -> Result<Captured> {
-    let io_error = |e: io::Error| AppError::new("process", e.to_string());
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // SAFETY: scalar Linux syscalls only; no allocations/locks after fork.
-    unsafe {
-        let parent = libc::getpid();
-        command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            if libc::getppid() != parent {
-                libc::_exit(125);
-            }
-            Ok(())
-        });
+fn process_error(error: io::Error) -> AppError {
+    AppError::new("process", error.to_string())
+}
+
+pub struct Managed {
+    running: RunningChild,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    out: Vec<u8>,
+    err: Vec<u8>,
+    truncated: bool,
+}
+
+impl Managed {
+    pub fn spawn(command: Command) -> Result<Self> {
+        Self::with_stdin(command, Stdio::null())
     }
-    let mut running = RunningChild(command.spawn().map_err(io_error)?);
-    let mut stdin = running.0.stdin.take();
-    let mut stdout = running
-        .0
-        .stdout
-        .take()
-        .ok_or_else(|| AppError::new("process", "Нет stdout"))?;
-    let mut stderr = running
-        .0
-        .stderr
-        .take()
-        .ok_or_else(|| AppError::new("process", "Нет stderr"))?;
-    nonblocking(&stdout).map_err(io_error)?;
-    nonblocking(&stderr).map_err(io_error)?;
+
+    fn with_stdin(mut command: Command, stdin: Stdio) -> Result<Self> {
+        command
+            .stdin(stdin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: scalar Linux syscalls only; no allocations/locks after fork.
+        unsafe {
+            let parent = libc::getpid();
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(125);
+                }
+                Ok(())
+            });
+        }
+        let mut running = RunningChild(command.spawn().map_err(process_error)?);
+
+        let stdout = running
+            .0
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::new("process", "Нет stdout"))?;
+        let stderr = running
+            .0
+            .stderr
+            .take()
+            .ok_or_else(|| AppError::new("process", "Нет stderr"))?;
+        nonblocking(&stdout).map_err(process_error)?;
+        nonblocking(&stderr).map_err(process_error)?;
+        Ok(Self {
+            running,
+            stdout,
+            stderr,
+            out: Vec::new(),
+            err: Vec::new(),
+            truncated: false,
+        })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.running.0.id()
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        drain(&mut self.stdout, &mut self.out, &mut self.truncated).map_err(process_error)?;
+        drain(&mut self.stderr, &mut self.err, &mut self.truncated).map_err(process_error)
+    }
+
+    pub fn poll(&mut self) -> Result<Option<ExitStatus>> {
+        self.drain()?;
+        let status = self.running.0.try_wait().map_err(process_error)?;
+        if status.is_some() {
+            self.drain()?;
+        }
+        Ok(status)
+    }
+
+    pub fn diagnostics(&self) -> String {
+        format!(
+            "{}\n{}{}",
+            String::from_utf8_lossy(&self.err),
+            String::from_utf8_lossy(&self.out),
+            if self.truncated {
+                "\nВывод усечён"
+            } else {
+                ""
+            }
+        )
+    }
+
+    fn captured(&self, status: ExitStatus) -> Captured {
+        Captured {
+            status,
+            stdout: String::from_utf8_lossy(&self.out).into_owned(),
+            stdout_valid_utf8: std::str::from_utf8(&self.out).is_ok(),
+            stderr: String::from_utf8_lossy(&self.err).into_owned(),
+            truncated: self.truncated,
+        }
+    }
+
+    pub fn stop(&mut self, grace: Duration) -> Result<(Captured, bool)> {
+        if let Some(status) = self.poll()? {
+            return Ok((self.captured(status), false));
+        }
+        // SAFETY: the child has not been reaped, so its PID cannot be reused.
+        if unsafe { libc::kill(self.id() as libc::pid_t, libc::SIGTERM) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(process_error(error));
+            }
+        }
+        let start = Instant::now();
+        loop {
+            if let Some(status) = self.poll()? {
+                return Ok((self.captured(status), false));
+            }
+            if start.elapsed() >= grace {
+                self.running.0.kill().map_err(process_error)?;
+                let status = self.running.0.wait().map_err(process_error)?;
+                self.drain()?;
+                return Ok((self.captured(status), true));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+pub fn capture(command: Command, input: &[u8], timeout: Duration) -> Result<Captured> {
+    let mut running = if input.is_empty() {
+        Managed::spawn(command)?
+    } else {
+        Managed::with_stdin(command, Stdio::piped())?
+    };
+    let mut stdin = running.running.0.stdin.take();
     if let Some(pipe) = &stdin {
-        nonblocking(pipe).map_err(io_error)?;
+        nonblocking(pipe).map_err(process_error)?;
     }
     let mut sent = 0;
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let mut truncated = false;
     let start = Instant::now();
     let status = loop {
-        drain(&mut stdout, &mut out, &mut truncated).map_err(io_error)?;
-        drain(&mut stderr, &mut err, &mut truncated).map_err(io_error)?;
+        running.drain()?;
         if sent == input.len() {
             stdin.take();
         } else if let Some(pipe) = &mut stdin {
@@ -117,43 +215,31 @@ pub fn capture(mut command: Command, input: &[u8], timeout: Duration) -> Result<
                         e.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                     ) => {}
-                Err(e) => return Err(io_error(e)),
+                Err(e) => return Err(process_error(e)),
             }
         }
-        if let Some(status) = running.0.try_wait().map_err(io_error)? {
+        if let Some(status) = running.poll()? {
             break status;
         }
         if start.elapsed() >= timeout {
+            let diagnostic = running.diagnostics();
+            running.stop(Duration::ZERO)?;
             return Err(AppError::new(
                 "timeout",
                 format!(
-                    "Процесс превысил {} мс; дочерний процесс остановлен{}\n{}\n{}",
+                    "Процесс превысил {} мс; дочерний процесс остановлен\n{}",
                     timeout.as_millis(),
-                    if truncated {
-                        "; вывод усечён"
-                    } else {
-                        ""
-                    },
-                    String::from_utf8_lossy(&err),
-                    String::from_utf8_lossy(&out)
+                    diagnostic
                 ),
             ));
         }
         thread::sleep(Duration::from_millis(5));
     };
-    drain(&mut stdout, &mut out, &mut truncated).map_err(io_error)?;
-    drain(&mut stderr, &mut err, &mut truncated).map_err(io_error)?;
     if status.success() && sent != input.len() {
         return Err(AppError::new(
             "process",
             "Процесс завершился до полной передачи stdin",
         ));
     }
-    Ok(Captured {
-        status,
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stdout_valid_utf8: std::str::from_utf8(&out).is_ok(),
-        stderr: String::from_utf8_lossy(&err).into_owned(),
-        truncated,
-    })
+    Ok(running.captured(status))
 }
