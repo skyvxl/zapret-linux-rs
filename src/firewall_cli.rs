@@ -12,16 +12,18 @@ pub fn run(args: &[&str]) -> Result<Value> {
     let (operation, args) = args
         .split_first()
         .ok_or_else(|| AppError::new("usage", "Требуется firewall plan"))?;
-    if *operation != "plan" {
-        return Err(AppError::new("usage", "Поддерживается firewall plan"));
+    if !["plan", "verify"].contains(operation) {
+        return Err(AppError::new(
+            "usage",
+            "Поддерживается firewall plan или verify",
+        ));
     }
     let mut values = BTreeMap::new();
     let (chunks, remainder) = args.as_chunks::<2>();
     for pair in chunks {
-        if !["--config", "--strategies", "--assets"].contains(&pair[0])
-            || pair[1].starts_with("--")
-            || values.insert(pair[0], pair[1]).is_some()
-        {
+        let allowed = ["--config", "--strategies", "--assets"].contains(&pair[0])
+            || (*operation == "verify" && ["--nft", "--timeout-ms"].contains(&pair[0]));
+        if !allowed || pair[1].starts_with("--") || values.insert(pair[0], pair[1]).is_some() {
             return Err(AppError::new(
                 "usage",
                 format!(
@@ -49,7 +51,21 @@ pub fn run(args: &[&str]) -> Result<Value> {
         config.gamefilterudp,
     )?;
     let firewall = FirewallPlan::new(&config, &strategy)?;
-    Ok(
-        json!({"config": config.json(), "strategy_file": strategy_file, "firewall": firewall.json()}),
-    )
+    let mut result = json!({"config": config.json(), "strategy_file": strategy_file, "firewall": firewall.json()});
+    if *operation == "verify" {
+        let timeout: u64 = values
+            .get("--timeout-ms")
+            .unwrap_or(&"5000")
+            .parse()
+            .ok()
+            .filter(|n| (1..=60000).contains(n))
+            .ok_or_else(|| AppError::new("usage", "--timeout-ms: ожидается 1..60000"))?;
+        result["validation"] = crate::firewall_verify::verify(
+            &firewall,
+            Path::new(required("--nft")?),
+            std::time::Duration::from_millis(timeout),
+        )?;
+        result["firewall"]["kernel_validation"] = json!("passed");
+    }
+    Ok(result)
 }

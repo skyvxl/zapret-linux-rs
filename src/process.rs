@@ -10,6 +10,7 @@ use std::{
 pub struct Captured {
     pub status: ExitStatus,
     pub stdout: String,
+    pub stdout_valid_utf8: bool,
     pub stderr: String,
     pub truncated: bool,
 }
@@ -126,8 +127,15 @@ pub fn capture(mut command: Command, input: &[u8], timeout: Duration) -> Result<
             return Err(AppError::new(
                 "timeout",
                 format!(
-                    "Процесс превысил {} мс; дочерний процесс остановлен",
-                    timeout.as_millis()
+                    "Процесс превысил {} мс; дочерний процесс остановлен{}\n{}\n{}",
+                    timeout.as_millis(),
+                    if truncated {
+                        "; вывод усечён"
+                    } else {
+                        ""
+                    },
+                    String::from_utf8_lossy(&err),
+                    String::from_utf8_lossy(&out)
                 ),
             ));
         }
@@ -144,6 +152,7 @@ pub fn capture(mut command: Command, input: &[u8], timeout: Duration) -> Result<
     Ok(Captured {
         status,
         stdout: String::from_utf8_lossy(&out).into_owned(),
+        stdout_valid_utf8: std::str::from_utf8(&out).is_ok(),
         stderr: String::from_utf8_lossy(&err).into_owned(),
         truncated,
     })

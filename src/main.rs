@@ -2,7 +2,9 @@ mod config;
 mod error;
 mod firewall;
 mod firewall_cli;
+mod firewall_verify;
 mod input;
+mod namespace;
 mod process;
 mod runtime;
 mod strategy;
@@ -28,7 +30,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\n--help"
+                "zapret-linux-rs — проверка конфигурации\n\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\n--help"
             );
             Ok(())
         }
