@@ -20,3 +20,13 @@ impl AppError {
         json!({"error": {"kind": self.kind, "message": self.message}})
     }
 }
+pub fn combine<T>(result: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (result, cleanup) {
+        (Err(first), Err(second)) => Err(AppError::new(
+            first.kind,
+            format!("{}; {}", first.message, second.message),
+        )),
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}

@@ -163,7 +163,7 @@ pub fn resolve_strategy(directory: &Path, name: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn validate_engine(binary: &Path, plan: &Plan, timeout: Duration) -> Result<Value> {
+pub fn validate_engine(binary: &Path, plan: &Plan, timeout: Duration) -> Result<Value> {
     let mut command = Command::new(binary);
     command
         .args([
@@ -175,6 +175,10 @@ fn validate_engine(binary: &Path, plan: &Plan, timeout: Duration) -> Result<Valu
         .current_dir(&plan.assets)
         .env_clear()
         .env("LANG", "C");
+    validate_command(command, timeout)
+}
+
+pub fn validate_command(command: Command, timeout: Duration) -> Result<Value> {
     let output = crate::process::capture(command, &[], timeout).map_err(|e| {
         AppError::new(
             if e.kind == "timeout" {
