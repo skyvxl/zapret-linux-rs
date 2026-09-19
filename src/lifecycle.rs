@@ -360,7 +360,7 @@ fn execute<T>(
         );
         let ready = json!({"event":"ready", "scope":scope, "isolation":isolation,
             "run_for_ms":run_for.map(|duration|duration.as_millis()),"duration_starts_after_ready":true,
-            "queue_ownership":if host {"exclusive_child_netfilter_sockets"} else {"not_inspected"},
+            "queue_ownership":if host {"verified_child_nfqueue_socket"} else {"not_inspected"},
             "readiness":"queue_packet_roundtrip", "engine_pid":child.id(), "strategy_file":file,
             "queue_num":QUEUE_NUM, "fwmark":FWMARK, "network_validation":"not_run",
             "config":config.json(),"plan":plan.json(true),"engine_binary":binary,"validation":validation,
