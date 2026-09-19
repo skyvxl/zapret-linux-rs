@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     fs,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -175,6 +176,14 @@ pub fn validate_engine(binary: &Path, plan: &Plan, timeout: Duration) -> Result<
         .current_dir(&plan.assets)
         .env_clear()
         .env("LANG", "C");
+    if crate::service_fs::uid() == 0 {
+        // Match runtime identity restrictions so dry-run can read private snapshots
+        // and cannot clear Managed's parent-death signal by switching UID/GID.
+        // SAFETY: restrict_child_ids uses only stack buffers and syscalls after fork.
+        unsafe {
+            command.pre_exec(crate::host_run::restrict_child_ids);
+        }
+    }
     validate_command(command, timeout)
 }
 
