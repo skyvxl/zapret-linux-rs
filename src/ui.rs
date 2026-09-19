@@ -221,6 +221,93 @@ fn choose_strategy() -> Result<Navigation> {
         }
     }
 }
+fn choose_interface(current: &str) -> Result<Navigation> {
+    let network = std::path::Path::new("/sys/class/net");
+    let read_error = |error| {
+        AppError::new(
+            "interfaces",
+            format!("Не удалось прочитать список интерфейсов: {error}"),
+        )
+    };
+    let mut interfaces = Vec::new();
+    for entry in std::fs::read_dir(network).map_err(read_error)? {
+        let entry = entry.map_err(read_error)?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            AppError::new("interfaces", "Имя сетевого интерфейса не является UTF-8")
+        })?;
+        let state = std::fs::read_to_string(entry.path().join("operstate")).unwrap_or_default();
+        let state = match state.trim() {
+            "up" => "UP",
+            "down" => "DOWN",
+            "dormant" => "DORMANT",
+            "lowerlayerdown" => "LOWERLAYERDOWN",
+            "notpresent" => "NOTPRESENT",
+            "testing" => "TESTING",
+            _ => "UNKNOWN",
+        };
+        interfaces.push((name, state));
+    }
+    interfaces.sort_by(|a, b| a.0.cmp(&b.0));
+    loop {
+        ui_terminal::redraw();
+        ui_terminal::title("Выбор интерфейса");
+        let selected = |name: &str| {
+            if name == current {
+                " [выбран]"
+            } else {
+                ""
+            }
+        };
+        println!("1. any — все интерфейсы{}", selected("any"));
+        for (i, (name, state)) in interfaces.iter().enumerate() {
+            let local = if name == "lo" {
+                "; локальный"
+            } else {
+                ""
+            };
+            println!(
+                "{}. {} — {state}{local}{}",
+                i + 2,
+                name.escape_debug(),
+                selected(name)
+            );
+        }
+        if current != "any" && !interfaces.iter().any(|(name, _)| name == current) {
+            println!(
+                "Сохранённый интерфейс {} сейчас отсутствует.",
+                current.escape_debug()
+            );
+        }
+        println!("UP — активен; DOWN — не активен; UNKNOWN — состояние неизвестно.\n0. Назад");
+        let Some(choice) = ui_terminal::prompt("Номер интерфейса: ")? else {
+            return Ok(Navigation::Back);
+        };
+        if choice == "0" {
+            return Ok(Navigation::Back);
+        }
+        let interface = match choice.parse::<usize>() {
+            Ok(1) => Some("any"),
+            Ok(i) if i >= 2 => interfaces.get(i - 2).map(|(name, _)| name.as_str()),
+            _ => None,
+        };
+        if let Some(interface) = interface {
+            let result = if interface != "any" && !network.join(interface).exists() {
+                Err(AppError::new(
+                    "interfaces",
+                    "Интерфейс исчез. Откройте список заново.",
+                ))
+            } else {
+                config(&["--interface", interface])
+            };
+            show_result(result)?;
+            return acknowledge();
+        }
+        println!("Неверный номер интерфейса.");
+        if acknowledge()? == Navigation::Exit {
+            return Ok(Navigation::Exit);
+        }
+    }
+}
 fn settings() -> Result<Navigation> {
     loop {
         let paths = AppPaths::discover()?;
@@ -236,13 +323,11 @@ fn settings() -> Result<Navigation> {
         };
         let result = match choice.as_str() {
             "0" => return Ok(Navigation::Back),
-            "1" => {
-                let Some(interface) = ui_terminal::prompt("Интерфейс (any — все): ")?
-                else {
-                    return Ok(Navigation::Back);
-                };
-                config(&["--interface", &interface])
-            }
+            "1" => match choose_interface(&c.interface) {
+                Ok(Navigation::Exit) => return Ok(Navigation::Exit),
+                Ok(Navigation::Back) => continue,
+                Err(error) => Err(error),
+            },
             "2" => config(&[
                 "--gamefilter-tcp",
                 if c.gamefiltertcp { "false" } else { "true" },
