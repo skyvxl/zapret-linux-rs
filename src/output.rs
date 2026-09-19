@@ -1,3 +1,5 @@
+#[path = "output/dashboard.rs"]
+mod dashboard;
 use crate::{
     error::{AppError, Result},
     signals::Signals,
@@ -10,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+thread_local! { static DASHBOARD: std::cell::RefCell<dashboard::Dashboard> = Default::default(); }
 thread_local! { static HUMAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 /// Explicit worker-only presentation; no environment-driven legacy changes.
@@ -25,8 +28,14 @@ impl Drop for Human {
     }
 }
 
+pub fn is_human() -> bool {
+    HUMAN.get()
+}
+
 fn render(value: &Value) -> String {
-    let text = |key: &str| value[key].as_str().unwrap_or("unknown");
+    if let Some(rendered) = DASHBOARD.with(|d| d.borrow_mut().update(value)) {
+        return rendered;
+    }
     match value["event"].as_str() {
         Some("ready") => format!(
             "Запущено: {}. Очередь и firewall проверены. Для остановки Ctrl+C.\n",
@@ -35,41 +44,6 @@ fn render(value: &Value) -> String {
         Some("stopped") if value["cleanup"] == "removed" => {
             "Остановлено: правила удалены, процесс завершён, очистка подтверждена.\n".into()
         }
-        Some("diagnosis_started") => format!(
-            "Начата диагностика {} стратегий.\n",
-            value["strategy_order"].as_array().map_or(0, Vec::len)
-        ),
-        Some("strategy_ready") => format!("Проверяется: {}\n", text("strategy")),
-        Some("strategy_complete") => {
-            let result = &value["result"];
-            let mut line = format!(
-                "{}: {} (очистка: {})\n",
-                result["strategy"], result["status"], result["cleanup_confirmed"]
-            );
-            if result["status"] == "failed"
-                && let Some(error) = result["error"].as_object()
-            {
-                line.push_str(&format!(
-                    "Ошибка ({}): {}\n",
-                    error
-                        .get("kind")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown"),
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown")
-                ));
-            }
-            line
-        }
-        Some("diagnosis_complete") => format!(
-            "Диагностика: {}. TCP прошли: {}. QUIC прошли: {}.\nПроверена HTTP-доступность; воспроизведение видео и голос не проверялись.\n",
-            value["report"]["status"],
-            value["report"]["tcp_passed"],
-            value["report"]["quic_passed"]
-        ),
-        Some("probe_result") => format!("{}: {}\n", text("strategy"), value["result"]),
         _ => format!("{value}\n"),
     }
 }

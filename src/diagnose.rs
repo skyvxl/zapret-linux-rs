@@ -259,12 +259,23 @@ pub fn run(args: &[&str]) -> Result<()> {
                 abort = Some(error.message);
                 break;
             }
+            if output::is_human() {
+                output::emit(
+                    json!({"event":"strategy_started","strategy":name}),
+                    &signals,
+                    timeout,
+                    false,
+                )?;
+            }
             let mut checks = Vec::new();
             let mut evidence = Value::Null;
             let mut ready_reached = false;
             let mut sink_failed = false;
-            let outcome =
-                lifecycle::supervise(&runtime, Some(name), &signals, |child, ready, _, _| {
+            let outcome = lifecycle::supervise(
+                &runtime,
+                Some(name),
+                &signals,
+                |child, ready, _, _| {
                     evidence = ready.clone();
                     ready_reached = true;
                     output::emit(
@@ -283,6 +294,10 @@ pub fn run(args: &[&str]) -> Result<()> {
                                 queue_probe::alive(child)?;
                                 queue_owner::require(child.id())
                             };
+                            if output::is_human() {
+                                output::emit(json!({"event":"probe_started","strategy":name,"target":target.id,"transport":if transport {"quic"} else {"tcp"}}), &signals, timeout, true)
+                                    .inspect_err(|e| { sink_failed = e.kind != "interrupted"; })?;
+                            }
                             let result = probe.check(target, transport, &mut tick)?;
                             tick()?;
                             checks.push(result.clone());
@@ -298,7 +313,8 @@ pub fn run(args: &[&str]) -> Result<()> {
                         }
                     }
                     Ok(())
-                });
+                },
+            );
             if sink_failed {
                 return outcome.result;
             }
@@ -343,7 +359,9 @@ pub fn run(args: &[&str]) -> Result<()> {
         timeout,
         false,
     )?;
-    output::stderr(&table(&final_report), &signals, timeout)?;
+    if !output::is_human() {
+        output::stderr(&table(&final_report), &signals, timeout)?;
+    }
     if let Some(reason) = abort {
         return Err(AppError::new("diagnosis_aborted", reason));
     }
