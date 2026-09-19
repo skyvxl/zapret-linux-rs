@@ -15,7 +15,7 @@ print_help() {
         '  ./service.sh КОМАНДА ...     передать команду интерфейсу Rust' \
         '  ./service.sh --help          показать эту справку' \
         '' \
-        'Обычные команды интерфейса: setup, run, diagnose, config, doctor, service.'
+        'Обычные команды интерфейса: setup, update, run, diagnose, config, doctor, service, recover.'
 }
 
 die() {

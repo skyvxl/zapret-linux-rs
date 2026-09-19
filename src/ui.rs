@@ -141,7 +141,12 @@ fn setup(args: &[&str]) -> Result<()> {
         println!("{value}");
     } else {
         println!(
-            "Данные проверены: {} стратегий; nfqws dry-run: {}.\nКонфигурация: {}",
+            "{}: {} стратегий; nfqws dry-run: {}.\nКонфигурация: {}",
+            if args.first() == Some(&"update") {
+                "Стратегии обновлены и проверены"
+            } else {
+                "Данные проверены"
+            },
             value["bundle"]["strategy_count"],
             value["bundle"]["validation"]["status"],
             value["config"]["strategy"]
@@ -160,7 +165,31 @@ fn preparation() -> Result<()> {
     ui_terminal::supervise(Command::new(launcher).args(["deps", "--install"]))?;
     setup(&["setup"])
 }
-fn choose_strategy() -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Navigation {
+    Back,
+    Exit,
+}
+fn acknowledge() -> Result<Navigation> {
+    Ok(
+        if ui_terminal::prompt("Нажмите Enter для продолжения: ")?.is_some() {
+            Navigation::Back
+        } else {
+            Navigation::Exit
+        },
+    )
+}
+fn show_result(result: Result<()>) -> Result<()> {
+    if let Err(error) = result {
+        if error.kind == "shutdown" {
+            return Err(error);
+        }
+        human_error(&error);
+    }
+    Ok(())
+}
+fn choose_strategy() -> Result<Navigation> {
+    ui_terminal::redraw();
     ui_terminal::title("Выбор стратегии (0 — назад)");
     let paths = AppPaths::discover()?;
     let bundle = app_setup::validate_bundle(&paths)?;
@@ -169,38 +198,48 @@ fn choose_strategy() -> Result<()> {
     }
     loop {
         let Some(choice) = ui_terminal::prompt("Номер стратегии: ")? else {
-            return Ok(());
+            return Ok(Navigation::Back);
         };
         if choice == "0" {
-            return Ok(());
+            return Ok(Navigation::Back);
         }
         if let Ok(i) = choice.parse::<usize>()
             && i > 0
             && let Some(name) = bundle.strategy_names.get(i - 1)
         {
-            return config(&["--strategy", name]);
+            show_result(config(&["--strategy", name]))?;
+            return acknowledge();
         }
         println!("Неверный номер стратегии.");
+        if acknowledge()? == Navigation::Exit {
+            return Ok(Navigation::Exit);
+        }
+        ui_terminal::redraw();
+        ui_terminal::title("Выбор стратегии (0 — назад)");
+        for (i, name) in bundle.strategy_names.iter().enumerate() {
+            println!(" {}. {name}", i + 1);
+        }
     }
 }
-fn settings() -> Result<()> {
+fn settings() -> Result<Navigation> {
     loop {
         let paths = AppPaths::discover()?;
         let c = paths.load_or_create_config()?;
+        ui_terminal::redraw();
         ui_terminal::title("Настройки");
         config_text(&c);
         println!(
             "1. Интерфейс\n2. Переключить GameFilter TCP\n3. Переключить GameFilter UDP\n0. Назад"
         );
         let Some(choice) = ui_terminal::prompt("Выбор: ")? else {
-            return Ok(());
+            return Ok(Navigation::Back);
         };
         let result = match choice.as_str() {
-            "0" => return Ok(()),
+            "0" => return Ok(Navigation::Back),
             "1" => {
                 let Some(interface) = ui_terminal::prompt("Интерфейс (any — все): ")?
                 else {
-                    return Ok(());
+                    return Ok(Navigation::Back);
                 };
                 config(&["--interface", &interface])
             }
@@ -214,19 +253,21 @@ fn settings() -> Result<()> {
             ]),
             _ => {
                 println!("Неверный выбор.");
+                if acknowledge()? == Navigation::Exit {
+                    return Ok(Navigation::Exit);
+                }
                 continue;
             }
         };
-        if let Err(e) = result {
-            if e.kind == "shutdown" {
-                return Err(e);
-            }
-            human_error(&e);
+        show_result(result)?;
+        if acknowledge()? == Navigation::Exit {
+            return Ok(Navigation::Exit);
         }
     }
 }
-fn service_menu() -> Result<()> {
+fn service_menu() -> Result<Navigation> {
     loop {
+        ui_terminal::redraw();
         ui_terminal::title("Системная служба");
         println!(
             "Служба хранит отдельный неизменяемый снимок настроек. Для замены: удалить, затем установить. Удаление останавливает только принадлежащую приложению службу."
@@ -235,10 +276,10 @@ fn service_menu() -> Result<()> {
             "1. Установить выбранную конфигурацию\n2. Запустить\n3. Остановить\n4. Перезапустить\n5. Автозапуск: включить\n6. Автозапуск: выключить\n7. Статус и установленная стратегия\n8. Удалить службу\n0. Назад"
         );
         let Some(choice) = ui_terminal::prompt("Выбор: ")? else {
-            return Ok(());
+            return Ok(Navigation::Back);
         };
         let action = match choice.as_str() {
-            "0" => return Ok(()),
+            "0" => return Ok(Navigation::Back),
             "1" => "install",
             "2" => "start",
             "3" => "stop",
@@ -249,14 +290,15 @@ fn service_menu() -> Result<()> {
             "8" => "remove",
             _ => {
                 println!("Неверный выбор.");
+                if acknowledge()? == Navigation::Exit {
+                    return Ok(Navigation::Exit);
+                }
                 continue;
             }
         };
-        if let Err(e) = ui_actions::launch("service", Some(action)) {
-            if e.kind == "shutdown" {
-                return Err(e);
-            }
-            human_error(&e);
+        show_result(ui_actions::launch("service", Some(action)))?;
+        if acknowledge()? == Navigation::Exit {
+            return Ok(Navigation::Exit);
         }
     }
 }
@@ -268,6 +310,7 @@ fn menu() -> Result<()> {
         ));
     }
     loop {
+        ui_terminal::redraw();
         ui_terminal::title("zapret-linux-rs");
         match AppPaths::discover().and_then(|p| p.load_or_create_config()) {
             Ok(c) => println!(
@@ -277,7 +320,7 @@ fn menu() -> Result<()> {
             Err(e) => human_error(&e),
         }
         println!(
-            "1. Подготовить зависимости и данные\n2. Запустить до Ctrl+C\n3. Диагностика всех стратегий\n4. Выбрать стратегию\n5. Настройки\n6. Системная служба\n7. Диагностика окружения\n8. Восстановить ручное состояние\n0. Выход"
+            "1. Подготовить зависимости и данные\n2. Запустить до Ctrl+C\n3. Диагностика всех стратегий\n4. Выбрать стратегию\n5. Настройки\n6. Системная служба\n7. Диагностика окружения\n8. Восстановить ручное состояние\n9. Обновить стратегии (явно, с загрузкой)\n0. Выход"
         );
         let Some(choice) = ui_terminal::prompt("Выбор: ")? else {
             return Ok(());
@@ -287,21 +330,35 @@ fn menu() -> Result<()> {
             "1" => preparation(),
             "2" => ui_actions::launch("run", None),
             "3" => ui_actions::launch("diagnose", None),
-            "4" => choose_strategy(),
-            "5" => settings(),
-            "6" => service_menu(),
+            "4" => match choose_strategy() {
+                Ok(Navigation::Exit) => return Ok(()),
+                Ok(Navigation::Back) => continue,
+                Err(error) => Err(error),
+            },
+            "5" => match settings() {
+                Ok(Navigation::Exit) => return Ok(()),
+                Ok(Navigation::Back) => continue,
+                Err(error) => Err(error),
+            },
+            "6" => match service_menu() {
+                Ok(Navigation::Exit) => return Ok(()),
+                Ok(Navigation::Back) => continue,
+                Err(error) => Err(error),
+            },
             "7" => doctor(),
             "8" => ui_actions::launch("recover", None),
+            "9" => setup(&["update"]),
             _ => {
-                println!("Неверный выбор. Введите число от 0 до 8.");
+                println!("Неверный выбор. Введите число от 0 до 9.");
+                if acknowledge()? == Navigation::Exit {
+                    return Ok(());
+                }
                 continue;
             }
         };
-        if let Err(e) = result {
-            if e.kind == "shutdown" {
-                return Err(e);
-            }
-            human_error(&e);
+        show_result(result)?;
+        if acknowledge()? == Navigation::Exit {
+            return Ok(());
         }
     }
 }
@@ -318,7 +375,7 @@ pub fn run(args: &[&str]) -> Result<()> {
         ["run"] => ui_actions::launch("run", None),
         ["diagnose"] => ui_actions::launch("diagnose", None),
         ["recover"] => ui_actions::launch("recover", None),
-        ["service"] => service_menu(),
+        ["service"] => service_menu().map(|_| ()),
         ["service", action] => ui_actions::launch("service", Some(action)),
         ["worker", rest @ ..] => ui_actions::worker(rest),
         _ => Err(usage()),

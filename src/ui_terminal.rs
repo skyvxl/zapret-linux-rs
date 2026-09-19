@@ -12,11 +12,17 @@ use std::{
 pub fn is_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
+fn supports_screen() -> bool {
+    is_terminal() && std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb")
+}
+pub fn redraw() {
+    if supports_screen() {
+        // ED 2 clears the visible screen while leaving terminal scrollback intact.
+        print!("\x1b[2J\x1b[H");
+    }
+}
 pub fn title(text: &str) {
-    if is_terminal()
-        && std::env::var_os("NO_COLOR").is_none()
-        && std::env::var("TERM").is_ok_and(|v| v != "dumb")
-    {
+    if supports_screen() && std::env::var_os("NO_COLOR").is_none() {
         println!("\n\x1b[1;36m{text}\x1b[0m");
     } else {
         println!("\n{text}");
