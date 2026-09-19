@@ -15,55 +15,12 @@ use std::{
 };
 
 pub const NFQWS_ARCHIVE_NAME: &str = "zapret-v72.9.tar.gz";
-pub const STRATEGIES_ARCHIVE_NAME: &str =
-    "strategies-ef19845a801e4e743f7bdfdbd58f9745c6adbd60.tar.gz";
 pub const NFQWS_URL: &str =
     "https://github.com/bol-van/zapret/releases/download/v72.9/zapret-v72.9.tar.gz";
-pub const STRATEGIES_URL: &str = "https://codeload.github.com/Flowseal/zapret-discord-youtube/tar.gz/ef19845a801e4e743f7bdfdbd58f9745c6adbd60";
 pub const NFQWS_SHA256: &str = "1e14dc6320dd7b5a1f28ab8145ac76d7a7010ca3cbe71824aa4aa407f7279ddf";
-pub const STRATEGIES_SHA256: &str =
-    "9bd06fde016909131d3d07529f4019655ceb9f3e453bd38e229db21c275c323c";
 const NFQWS_LIMIT: u64 = 32 * 1024 * 1024;
 const STRATEGIES_LIMIT: u64 = 16 * 1024 * 1024;
-const FLOWSEAL_ROOT: &str = "zapret-discord-youtube-ef19845a801e4e743f7bdfdbd58f9745c6adbd60";
-
-pub const STRATEGIES: &[&str] = &[
-    "general (ALT).bat",
-    "general (ALT10).bat",
-    "general (ALT11).bat",
-    "general (ALT12).bat",
-    "general (ALT2).bat",
-    "general (ALT3).bat",
-    "general (ALT4).bat",
-    "general (ALT5).bat",
-    "general (ALT6).bat",
-    "general (ALT7).bat",
-    "general (ALT8).bat",
-    "general (ALT9).bat",
-    "general (FAKE TLS AUTO ALT).bat",
-    "general (FAKE TLS AUTO ALT2).bat",
-    "general (FAKE TLS AUTO ALT3).bat",
-    "general (FAKE TLS AUTO).bat",
-    "general (SIMPLE FAKE ALT).bat",
-    "general (SIMPLE FAKE ALT2).bat",
-    "general (SIMPLE FAKE).bat",
-    "general.bat",
-];
-
-pub const ASSETS: &[&str] = &[
-    "bin/quic_initial_dbankcloud_ru.bin",
-    "bin/quic_initial_www_google_com.bin",
-    "bin/stun.bin",
-    "bin/tls_clienthello_4pda_to.bin",
-    "bin/tls_clienthello_max_ru.bin",
-    "bin/tls_clienthello_www_google_com.bin",
-    "lists/ipset-all.txt",
-    "lists/ipset-all.txt.backup",
-    "lists/ipset-exclude.txt",
-    "lists/list-exclude.txt",
-    "lists/list-general.txt",
-    "lists/list-google.txt",
-];
+const HEAD_URL: &str = "https://api.github.com/repos/Flowseal/zapret-discord-youtube/commits/HEAD";
 
 fn fail(message: impl Into<String>) -> AppError {
     AppError::new("archive", message)
@@ -75,7 +32,7 @@ fn hash(bytes: &[u8]) -> String {
 
 fn verify(bytes: Vec<u8>, path: &Path, expected: &str) -> Result<Vec<u8>> {
     let actual = hash(&bytes);
-    if actual != expected {
+    if !expected.is_empty() && actual != expected {
         return Err(fail(format!(
             "{}: неверный SHA256 {actual}, ожидался {expected}",
             path.display()
@@ -158,6 +115,8 @@ fn download(paths: &AppPaths, name: &str, url: &str, limit: u64, digest: &str) -
             "--silent",
             "--show-error",
             "--location",
+            "--user-agent",
+            "zapret-linux-rs",
             "--max-redirs",
             "5",
             "--proto",
@@ -205,6 +164,12 @@ fn download(paths: &AppPaths, name: &str, url: &str, limit: u64, digest: &str) -
             return Err(error);
         }
     };
+    if digest.is_empty() {
+        directory
+            .unlink(&temporary_name, false)
+            .map_err(|e| fail(e.message))?;
+        return Ok(bytes);
+    }
     match directory.rename(&temporary_name, &directory, name) {
         Ok(()) => Ok(bytes),
         Err(_error) if directory.exists(name).unwrap_or(false) => {
@@ -221,43 +186,86 @@ fn download(paths: &AppPaths, name: &str, url: &str, limit: u64, digest: &str) -
 pub struct Archives {
     pub nfqws: Vec<u8>,
     pub strategies: Vec<u8>,
+    pub source: serde_json::Value,
 }
 
 pub fn acquire(paths: &AppPaths, offline: Option<&Path>) -> Result<Archives> {
-    if let Some(directory) = offline {
+    let (nfqws, strategies, revision, origin) = if let Some(directory) = offline {
         if !directory.is_absolute() {
             return Err(fail("--archive-dir должен быть абсолютным путём"));
         }
-        Dir::absolute(directory, false, false)
-            .map_err(|error| fail(format!("{}: {}", directory.display(), error.message)))?;
-        return Ok(Archives {
-            nfqws: read_verified(
+        let dir = Dir::absolute(directory, false, false)?;
+        let candidates: Vec<_> = dir
+            .names()?
+            .into_iter()
+            .filter(|name| {
+                name == "flowseal.tar.gz"
+                    || name
+                        .strip_prefix("strategies-")
+                        .and_then(|s| s.strip_suffix(".tar.gz"))
+                        .is_some_and(|s| {
+                            !s.is_empty()
+                                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        })
+            })
+            .collect();
+        if candidates.len() != 1 {
+            return Err(fail(
+                "Требуется один flowseal.tar.gz или strategies-<revision>.tar.gz; неоднозначный/отсутствующий архив",
+            ));
+        }
+        (
+            read_verified(
                 &directory.join(NFQWS_ARCHIVE_NAME),
                 NFQWS_LIMIT,
                 NFQWS_SHA256,
             )?,
-            strategies: read_verified(
-                &directory.join(STRATEGIES_ARCHIVE_NAME),
-                STRATEGIES_LIMIT,
-                STRATEGIES_SHA256,
-            )?,
-        });
-    }
-    Ok(Archives {
-        nfqws: download(
+            service_fs::source(&directory.join(&candidates[0]), STRATEGIES_LIMIT, false)?,
+            serde_json::Value::Null,
+            "local-unverified-publisher",
+        )
+    } else {
+        let nfqws = download(
             paths,
             NFQWS_ARCHIVE_NAME,
             NFQWS_URL,
             NFQWS_LIMIT,
             NFQWS_SHA256,
-        )?,
-        strategies: download(
+        )?;
+        let head = download(
             paths,
-            STRATEGIES_ARCHIVE_NAME,
-            STRATEGIES_URL,
-            STRATEGIES_LIMIT,
-            STRATEGIES_SHA256,
-        )?,
+            &format!("head-{}.json", service_fs::random_id()?),
+            HEAD_URL,
+            1024 * 1024,
+            "",
+        )?;
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&head).map_err(|e| fail(e.to_string()))?;
+        let revision = metadata["sha"]
+            .as_str()
+            .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| fail("GitHub HEAD не содержит commit SHA"))?;
+        let url = format!(
+            "https://codeload.github.com/Flowseal/zapret-discord-youtube/tar.gz/{revision}"
+        );
+        (
+            nfqws,
+            download(
+                paths,
+                &format!("flowseal-{revision}-{}.tar.gz", service_fs::random_id()?),
+                &url,
+                STRATEGIES_LIMIT,
+                "",
+            )?,
+            serde_json::json!(revision),
+            "official-github-https",
+        )
+    };
+    let source = serde_json::json!({"origin": origin, "revision": revision, "archive_sha256": hash(&strategies)});
+    Ok(Archives {
+        nfqws,
+        strategies,
+        source,
     })
 }
 
@@ -311,37 +319,18 @@ pub fn payload(stage: &Dir, stage_path: &Path, archives: &Archives) -> Result<Ve
     stage
         .write(".nfqws.tar.gz", &archives.nfqws, 0o600)
         .map_err(|error| fail(error.message))?;
-    stage
-        .write(".strategies.tar.gz", &archives.strategies, 0o600)
-        .map_err(|error| fail(error.message))?;
     let nfqws_archive = stage_path.join(".nfqws.tar.gz");
-    let strategies_archive = stage_path.join(".strategies.tar.gz");
     let engine = engine_spec()?;
     let engine_member = format!("zapret-v72.9/binaries/{}/nfqws", engine.directory);
-    let strategy_members = STRATEGIES
-        .iter()
-        .chain(ASSETS.iter())
-        .map(|name| format!("{FLOWSEAL_ROOT}/{name}"))
-        .collect::<Vec<_>>();
     let nfqws_extract = stage
         .mkdir(".nfqws-extract", 0o700)
         .map_err(|error| fail(error.message))?;
-    let strategies_extract = stage
-        .mkdir(".strategies-extract", 0o700)
-        .map_err(|error| fail(error.message))?;
     drop(nfqws_extract);
-    drop(strategies_extract);
     let nfqws_extract_path = stage_path.join(".nfqws-extract");
-    let strategies_extract_path = stage_path.join(".strategies-extract");
     extract_members(
         &nfqws_archive,
         &nfqws_extract_path,
         std::slice::from_ref(&engine_member),
-    )?;
-    extract_members(
-        &strategies_archive,
-        &strategies_extract_path,
-        &strategy_members,
     )?;
     let bytes = extracted(&nfqws_extract_path.join(&engine_member), engine.size as u64)?;
     if bytes.len() != engine.size || hash(&bytes) != engine.sha256 {
@@ -352,33 +341,13 @@ pub fn payload(stage: &Dir, stage_path: &Path, archives: &Archives) -> Result<Ve
         bytes,
         executable: true,
     }];
-    for name in STRATEGIES {
-        files.push(PayloadFile {
-            relative: Path::new("strategies").join(name),
-            bytes: extracted(
-                &strategies_extract_path.join(FLOWSEAL_ROOT).join(name),
-                64 * 1024,
-            )?,
-            executable: false,
-        });
-    }
-    for name in ASSETS {
-        files.push(PayloadFile {
-            relative: Path::new("assets").join(name),
-            bytes: extracted(
-                &strategies_extract_path.join(FLOWSEAL_ROOT).join(name),
-                2 * 1024 * 1024,
-            )?,
-            executable: false,
-        });
-    }
+    files.extend(crate::app_flowseal::payload(
+        &archives.strategies,
+        archives.source["revision"].as_str(),
+    )?);
     fs::remove_dir_all(&nfqws_extract_path).map_err(|error| fail(error.to_string()))?;
-    fs::remove_dir_all(&strategies_extract_path).map_err(|error| fail(error.to_string()))?;
     stage
         .unlink(".nfqws.tar.gz", false)
-        .map_err(|error| fail(error.message))?;
-    stage
-        .unlink(".strategies.tar.gz", false)
         .map_err(|error| fail(error.message))?;
     Ok(files)
 }

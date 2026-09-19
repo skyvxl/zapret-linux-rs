@@ -160,25 +160,6 @@ fn staged_paths(root: &Path) -> AppPaths {
         bundle_dir: root.join("bundle"),
     }
 }
-fn bundle_files() -> Vec<String> {
-    let mut files = vec!["manifest.json".into(), "bin/nfqws".into()];
-    files.extend(
-        app_archive::STRATEGIES
-            .iter()
-            .map(|s| format!("strategies/{s}")),
-    );
-    files.extend(app_archive::ASSETS.iter().map(|s| format!("assets/{s}")));
-    files.extend(
-        [
-            "list-general-user.txt",
-            "list-exclude-user.txt",
-            "ipset-exclude-user.txt",
-        ]
-        .iter()
-        .map(|s| format!("assets/lists/{s}")),
-    );
-    files
-}
 const DIRS: &[&str] = &["bin", "strategies", "assets", "assets/bin", "assets/lists"];
 /// Revalidate the private root copy before executing any engine.
 fn snapshot(
@@ -199,8 +180,10 @@ fn snapshot(
     let result = (|| {
         let bytes = service_fs::source(config, 64 * 1024, false)?;
         let config = Config::parse(std::str::from_utf8(&bytes).map_err(fail)?)?;
-        if !app_archive::STRATEGIES.contains(&config.strategy.as_str()) {
-            return Err(fail("Стратегия отсутствует в закреплённом наборе"));
+        let manifest_bytes = service_fs::source(&source.join("manifest.json"), 1024 * 1024, false)?;
+        let inventory = app_setup::checked_manifest(&manifest_bytes)?;
+        if !inventory.contains(&format!("strategies/{}", config.strategy)) {
+            return Err(fail("Стратегия отсутствует в bundle"));
         }
         stage.write("config.env", &bytes, 0o600)?;
         stage.mkdir("bundle", 0o700)?;
@@ -217,7 +200,9 @@ fn snapshot(
                 0o700,
             )?;
         }
-        for rel in bundle_files() {
+        let destination = Dir::absolute(&root.join("bundle"), false, false)?;
+        destination.write("manifest.json", &manifest_bytes, 0o600)?;
+        for rel in inventory {
             let p = Path::new(&rel);
             let bytes = service_fs::source(&source.join(p), 2 * 1024 * 1024, false)?;
             let dest = Dir::absolute(
@@ -266,16 +251,6 @@ fn remove_snapshot(state: &Dir, name: &str) -> Result<()> {
         {
             return Err(fail("owner: Snapshot не принадлежит этому действию"));
         }
-        fn basename(name: &str) -> bool {
-            name.len() <= 255
-                && name
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_alphanumeric)
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
-        }
         fn directory(prefix: &str, name: &str) -> bool {
             matches!(
                 (prefix, name),
@@ -303,8 +278,12 @@ fn remove_snapshot(state: &Dir, name: &str) -> Result<()> {
                             "" => ["owner", "config.env"].contains(&name.as_str()),
                             "bundle" => name == "manifest.json",
                             "bundle/bin" => name == "nfqws",
-                            "bundle/strategies" => basename(&name) && name.ends_with(".bat"),
-                            "bundle/assets/bin" | "bundle/assets/lists" => basename(&name),
+                            "bundle/strategies" => {
+                                service_fs::owned_data_basename(&name) && name.ends_with(".bat")
+                            }
+                            "bundle/assets/bin" | "bundle/assets/lists" => {
+                                service_fs::owned_data_basename(&name)
+                            }
                             _ => false,
                         };
                         if !allowed {
@@ -457,7 +436,7 @@ pub fn worker(args: &[&str]) -> Result<()> {
             ]);
             println!(
                 "Диагностика всех {} стратегий. Выбранная конфигурация не изменится.",
-                app_archive::STRATEGIES.len()
+                bundle.strategy_count
             );
             diagnose::run(&args.iter().map(String::as_str).collect::<Vec<_>>())
         }

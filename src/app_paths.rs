@@ -179,6 +179,14 @@ fn write_config(directory: &Dir, content: &[u8], replace: bool) -> Result<()> {
     result
 }
 
+#[derive(Default)]
+pub struct ConfigChanges {
+    pub interface: Option<String>,
+    pub strategy: Option<String>,
+    pub gamefiltertcp: Option<bool>,
+    pub gamefilterudp: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub config_dir: PathBuf,
@@ -199,12 +207,74 @@ impl AppPaths {
         let config_dir = checked_absolute("config", config_base.join(APP))?;
         let data_dir = checked_absolute("data", data_base.join(APP))?;
         let cache_dir = checked_absolute("cache", cache_base.join(APP))?;
-        Ok(Self {
+        let mut paths = Self {
             config_file: config_dir.join(CONFIG_NAME),
             bundle_dir: data_dir.join("bundle"),
             config_dir,
             data_dir,
             cache_dir,
+        };
+        paths.bundle_dir = paths.active_bundle()?;
+        Ok(paths)
+    }
+
+    pub fn active_bundle(&self) -> Result<PathBuf> {
+        if !self
+            .data_dir
+            .try_exists()
+            .map_err(|e| fail(e.to_string()))?
+        {
+            return Ok(self.data_dir.join("bundle"));
+        }
+        let directory = private_existing(&self.data_dir)?;
+        if !directory.exists("active-bundle")? {
+            return Ok(self.data_dir.join("bundle"));
+        }
+        let bytes = directory.read("active-bundle", 0o600, 100)?;
+        let name = std::str::from_utf8(&bytes).map_err(|e| fail(e.to_string()))?;
+        if !name.strip_prefix("bundle-").is_some_and(|s| {
+            s.len() == 64
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            return Err(fail("Некорректный указатель active-bundle"));
+        }
+        let path = self.data_dir.join(name);
+        private_existing(&path)?;
+        Ok(path)
+    }
+
+    pub fn publish_bundle(&self, name: &str) -> Result<()> {
+        let directory = private_existing(&self.data_dir)?;
+        if !name
+            .strip_prefix("bundle-")
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(fail("Некорректное имя поколения"));
+        }
+        private_existing(&self.data_dir.join(name))?;
+        // Refuse unsafe existing pointer without chmod or ownership takeover.
+        self.active_bundle()?;
+        let temporary = format!(".active-{}.tmp", service_fs::random_id()?);
+        directory.write(&temporary, name.as_bytes(), 0o600)?;
+        let old = CString::new(temporary.as_str()).map_err(|e| fail(e.to_string()))?;
+        let new = CString::new("active-bundle").map_err(|e| fail(e.to_string()))?;
+        if unsafe {
+            libc::renameat(
+                directory.0.as_raw_fd(),
+                old.as_ptr(),
+                directory.0.as_raw_fd(),
+                new.as_ptr(),
+            )
+        } != 0
+        {
+            let error = fail(std::io::Error::last_os_error().to_string());
+            let _ = directory.unlink(&temporary, false);
+            return Err(error);
+        }
+        directory.sync().map_err(|e| {
+            let active = self.active_bundle().map(|p| p.display().to_string()).unwrap_or_else(|e| e.message);
+            AppError::new("outcome_unknown", format!("Указатель переименован, fsync не подтверждён; поколение сохранено; active={active}: {}", e.message))
         })
     }
 
@@ -255,15 +325,36 @@ impl AppPaths {
         Config::parse(&text)
     }
 
-    pub fn save_config(&self, config: &Config) -> Result<()> {
+    pub fn update_config(&self, changes: ConfigChanges) -> Result<Config> {
+        self.ensure_private_dirs()?;
+        let _lock = crate::app_setup::lock(self)?;
         let directory = open_or_create_private(&self.config_dir)?;
-        if directory
-            .exists(CONFIG_NAME)
-            .map_err(|error| fail(error.message))?
-        {
-            self.load_config()?;
+        let mut config = if directory.exists(CONFIG_NAME)? {
+            self.load_config()?
+        } else {
+            Self::defaults()
+        };
+        if let Some(value) = changes.interface {
+            config.interface = value;
         }
-        write_config(&directory, config_text(config)?.as_bytes(), true)
+        if let Some(value) = changes.strategy {
+            config.strategy = value;
+        }
+        if let Some(value) = changes.gamefiltertcp {
+            config.gamefiltertcp = value;
+        }
+        if let Some(value) = changes.gamefilterudp {
+            config.gamefilterudp = value;
+        }
+
+        let mut paths = self.clone();
+        paths.bundle_dir = self.active_bundle()?;
+        if std::fs::symlink_metadata(&paths.bundle_dir).is_ok() {
+            let bundle = crate::app_setup::validate_bundle(&paths)?;
+            crate::app_setup::validate_config(&config, &bundle)?;
+        }
+        write_config(&directory, config_text(&config)?.as_bytes(), true)?;
+        Ok(config)
     }
 
     pub fn load_or_create_config(&self) -> Result<Config> {

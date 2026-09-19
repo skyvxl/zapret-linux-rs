@@ -1,5 +1,4 @@
 use crate::{
-    app_archive,
     app_paths::AppPaths,
     app_setup,
     config::Config,
@@ -11,7 +10,7 @@ use std::process::Command;
 fn usage() -> AppError {
     AppError::new(
         "usage",
-        "ui menu|setup [--archive-dir DIR] [--json]|doctor [--json]|paths|run|diagnose|config [--json] [--strategy NAME] [--interface NAME] [--gamefilter-tcp true|false] [--gamefilter-udp true|false]|service install|start|stop|restart|enable|disable|status|remove|recover",
+        "ui menu|setup|update [--archive-dir DIR] [--json]|doctor [--json]|paths|run|diagnose|config [--json] [--strategy NAME] [--interface NAME] [--gamefilter-tcp true|false] [--gamefilter-udp true|false]|service install|start|stop|restart|enable|disable|status|remove|recover",
     )
 }
 pub fn human_error(error: &AppError) {
@@ -52,7 +51,7 @@ fn boolean(s: &str) -> Result<bool> {
 }
 fn config(args: &[&str]) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let mut c = paths.load_or_create_config()?;
+    let mut changes = crate::app_paths::ConfigChanges::default();
     let mut json = false;
     let mut changed = false;
     let mut seen = std::collections::BTreeSet::new();
@@ -70,25 +69,26 @@ fn config(args: &[&str]) -> Result<()> {
         let val = *args.get(i + 1).ok_or_else(usage)?;
         match key {
             "--strategy" => {
-                if !app_archive::STRATEGIES.contains(&val) {
-                    return Err(AppError::new(
-                        "config",
-                        "Неизвестная стратегия; выберите стратегию из меню",
-                    ));
+                if !crate::app_flowseal::strategy_name(val) {
+                    return Err(AppError::new("config", "Недопустимое имя стратегии"));
                 }
-                c.strategy = val.into();
+                changes.strategy = Some(val.into());
             }
-            "--interface" => c.interface = val.into(),
-            "--gamefilter-tcp" => c.gamefiltertcp = boolean(val)?,
-            "--gamefilter-udp" => c.gamefilterudp = boolean(val)?,
+            "--interface" => changes.interface = Some(val.into()),
+            "--gamefilter-tcp" => changes.gamefiltertcp = Some(boolean(val)?),
+            "--gamefilter-udp" => changes.gamefilterudp = Some(boolean(val)?),
             _ => return Err(usage()),
         }
         changed = true;
         i += 2;
     }
-    if changed {
-        paths.save_config(&c)?;
-    }
+    let c = if changed {
+        paths.update_config(changes)?
+    } else if std::fs::symlink_metadata(&paths.config_file).is_ok() {
+        paths.load_config()?
+    } else {
+        AppPaths::defaults()
+    };
     if json {
         println!("{}", json!({"config":c.json()}));
     } else {
@@ -162,7 +162,9 @@ fn preparation() -> Result<()> {
 }
 fn choose_strategy() -> Result<()> {
     ui_terminal::title("Выбор стратегии (0 — назад)");
-    for (i, name) in app_archive::STRATEGIES.iter().enumerate() {
+    let paths = AppPaths::discover()?;
+    let bundle = app_setup::validate_bundle(&paths)?;
+    for (i, name) in bundle.strategy_names.iter().enumerate() {
         println!(" {}. {name}", i + 1);
     }
     loop {
@@ -174,7 +176,7 @@ fn choose_strategy() -> Result<()> {
         }
         if let Ok(i) = choice.parse::<usize>()
             && i > 0
-            && let Some(name) = app_archive::STRATEGIES.get(i - 1)
+            && let Some(name) = bundle.strategy_names.get(i - 1)
         {
             return config(&["--strategy", name]);
         }
@@ -311,7 +313,7 @@ pub fn run(args: &[&str]) -> Result<()> {
             Ok(())
         }
         ["doctor"] => doctor(),
-        ["setup", ..] => setup(args),
+        ["setup" | "update", ..] => setup(args),
         ["config", rest @ ..] => config(rest),
         ["run"] => ui_actions::launch("run", None),
         ["diagnose"] => ui_actions::launch("diagnose", None),

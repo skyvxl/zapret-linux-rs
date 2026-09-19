@@ -1,5 +1,6 @@
 mod app_arch;
 mod app_archive;
+mod app_flowseal;
 mod app_paths;
 mod app_setup;
 mod config;

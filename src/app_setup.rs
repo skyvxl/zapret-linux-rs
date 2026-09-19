@@ -1,5 +1,6 @@
 use crate::{
-    app_archive::{self, ASSETS, NFQWS_SHA256, STRATEGIES, STRATEGIES_SHA256},
+    app_archive::{self, NFQWS_SHA256},
+    app_flowseal::{self, GENERATED_LISTS},
     app_paths::AppPaths,
     config::Config,
     error::{AppError, Result},
@@ -19,14 +20,6 @@ use std::{
 };
 
 const MANIFEST: &str = "manifest.json";
-const GENERATED_LISTS: &[&str] = &[
-    "list-general-user.txt",
-    "list-exclude-user.txt",
-    "ipset-exclude-user.txt",
-];
-const FLOWSEAL_TREE_SHA256: &str =
-    "2fd7d7c43c7ddd6386e3369b69aead094ce7702dc334c239a0c97cca6e33f402";
-
 fn fail(message: impl Into<String>) -> AppError {
     AppError::new("bundle", message)
 }
@@ -40,7 +33,7 @@ fn string_path(path: &Path) -> Result<&str> {
         .ok_or_else(|| fail(format!("Путь не является UTF-8: {}", path.display())))
 }
 
-struct SetupLock(File);
+pub(crate) struct SetupLock(File);
 
 impl Drop for SetupLock {
     fn drop(&mut self) {
@@ -50,7 +43,7 @@ impl Drop for SetupLock {
     }
 }
 
-fn lock(paths: &AppPaths) -> Result<SetupLock> {
+pub(crate) fn lock(paths: &AppPaths) -> Result<SetupLock> {
     let directory =
         Dir::absolute(&paths.cache_dir, false, false).map_err(|error| fail(error.message))?;
     if !directory
@@ -84,6 +77,9 @@ pub struct Bundle {
     pub assets: PathBuf,
     pub manifest: PathBuf,
     pub strategy_count: usize,
+    pub strategy_names: Vec<String>,
+    pub files: Vec<String>,
+    pub manifest_bytes: Vec<u8>,
     pub reused: bool,
     pub validation: Value,
 }
@@ -96,7 +92,10 @@ impl Bundle {
             assets: root.join("assets"),
             manifest: root.join(MANIFEST),
             root,
-            strategy_count: STRATEGIES.len(),
+            strategy_count: 0,
+            strategy_names: Vec::new(),
+            files: Vec::new(),
+            manifest_bytes: Vec::new(),
             reused: false,
             validation: json!({"status": "not_run"}),
         }
@@ -110,56 +109,78 @@ impl Bundle {
             "assets": self.assets,
             "manifest": self.manifest,
             "strategy_count": self.strategy_count,
+            "strategy_names": self.strategy_names,
             "reused": self.reused,
             "validation": self.validation,
         })
     }
 }
 
-fn expected_files() -> BTreeSet<String> {
-    let mut files = BTreeSet::from(["bin/nfqws".to_string()]);
-    files.extend(STRATEGIES.iter().map(|name| format!("strategies/{name}")));
-    files.extend(ASSETS.iter().map(|name| format!("assets/{name}")));
-    files.extend(
-        GENERATED_LISTS
-            .iter()
-            .map(|name| format!("assets/lists/{name}")),
-    );
-    files
-}
-
-fn flowseal_tree_digest(entries: &[Value]) -> Result<String> {
-    let mut rows = entries
-        .iter()
-        .filter_map(|entry| {
-            let path = entry.get("path")?.as_str()?;
-            (path != "bin/nfqws").then(|| {
-                Ok((
-                    path.to_string(),
-                    entry
-                        .get("size")
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| fail("Manifest содержит некорректный размер"))?,
-                    entry
-                        .get("sha256")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| fail("Manifest содержит некорректный digest"))?
-                        .to_string(),
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    rows.sort();
-    let mut hasher = Sha256::new();
-    for (path, size, digest) in rows {
-        hasher.update(path.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(size.to_string().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(digest.as_bytes());
-        hasher.update(b"\n");
+/// Parse once at the privilege boundary; these bounded paths are copy authority, never deletion authority.
+pub fn checked_manifest(bytes: &[u8]) -> Result<Vec<String>> {
+    if bytes.len() > 1024 * 1024 {
+        return Err(fail("Manifest слишком большой"));
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let manifest: Value = serde_json::from_slice(bytes).map_err(|e| fail(e.to_string()))?;
+    if !matches!(manifest["schema"].as_u64(), Some(1 | 2))
+        || manifest["nfqws_archive_sha256"] != NFQWS_SHA256
+        || manifest["engine_arch"] != std::env::consts::ARCH
+        || manifest["engine_sha256"] != app_archive::engine_spec()?.sha256
+    {
+        return Err(fail("Manifest имеет неизвестную схему или другой nfqws"));
+    }
+    let entries = manifest["files"]
+        .as_array()
+        .ok_or_else(|| fail("Manifest не содержит файлы"))?;
+    if entries.len() > app_flowseal::ENTRY_LIMIT {
+        return Err(fail("Слишком много файлов manifest"));
+    }
+    let mut files = BTreeSet::new();
+    let mut aliases = BTreeSet::new();
+    let mut total = 0;
+    for entry in entries {
+        let path = entry["path"]
+            .as_str()
+            .ok_or_else(|| fail("Некорректный путь manifest"))?;
+        let limit =
+            app_flowseal::file_limit(path).ok_or_else(|| fail("Недопустимый путь manifest"))?;
+        let size = entry["size"]
+            .as_u64()
+            .filter(|n| *n <= limit)
+            .ok_or_else(|| fail("Некорректный размер manifest"))?;
+        if GENERATED_LISTS
+            .iter()
+            .any(|name| path == format!("assets/lists/{name}"))
+            && (size != 0 || entry["sha256"] != digest(b""))
+        {
+            return Err(fail(
+                "Локальные пользовательские списки должны оставаться пустыми",
+            ));
+        }
+        total += size;
+        if total > app_flowseal::EXPANDED_LIMIT
+            || !files.insert(path.to_string())
+            || !aliases.insert(path.to_lowercase())
+        {
+            return Err(fail("Повторный путь или превышение лимита manifest"));
+        }
+        if entry["mode"].as_u64() != Some(if path == "bin/nfqws" { 0o700 } else { 0o600 })
+            || !entry["sha256"]
+                .as_str()
+                .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(fail("Некорректный режим или SHA256 manifest"));
+        }
+    }
+    if !files.contains("bin/nfqws")
+        || !files.iter().any(|s| s.starts_with("strategies/"))
+        || GENERATED_LISTS
+            .iter()
+            .any(|s| !files.contains(&format!("assets/lists/{s}")))
+    {
+        return Err(fail("Manifest не содержит обязательные файлы"));
+    }
+    Ok(files.into_iter().collect())
 }
 
 fn inspect_tree(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
@@ -192,9 +213,17 @@ fn inspect_tree(root: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
                         "Некорректный владелец или режим каталога: {relative}"
                     )));
                 }
+                if !["bin", "strategies", "assets", "assets/bin", "assets/lists"]
+                    .contains(&relative.as_str())
+                {
+                    return Err(fail("Bundle содержит неизвестный каталог"));
+                }
                 directories.insert(relative);
                 recurse(root, &path, files, directories)?;
             } else if metadata.is_file() {
+                if files.len() > app_flowseal::ENTRY_LIMIT {
+                    return Err(fail("Bundle содержит слишком много файлов"));
+                }
                 files.insert(relative);
             } else {
                 return Err(fail("Bundle содержит не обычный файл или каталог"));
@@ -227,29 +256,11 @@ pub fn validate_bundle(paths: &AppPaths) -> Result<Bundle> {
         .map_err(|error| fail(format!("manifest: {}", error.message)))?;
     let manifest: Value =
         serde_json::from_slice(&manifest_bytes).map_err(|error| fail(error.to_string()))?;
-    if manifest.get("schema") != Some(&json!(1))
-        || manifest.get("nfqws_archive_sha256") != Some(&json!(NFQWS_SHA256))
-        || manifest.get("strategies_archive_sha256") != Some(&json!(STRATEGIES_SHA256))
-        || manifest.get("engine_arch") != Some(&json!(std::env::consts::ARCH))
-    {
-        return Err(fail(
-            "Manifest bundle имеет неизвестную версию или источник",
-        ));
-    }
     let engine = app_archive::engine_spec()?;
-    if manifest.get("engine_sha256") != Some(&json!(engine.sha256)) {
-        return Err(fail("Manifest содержит другой nfqws"));
-    }
-    let entries = manifest
-        .get("files")
-        .and_then(Value::as_array)
-        .ok_or_else(|| fail("Manifest не содержит список файлов"))?;
-    if flowseal_tree_digest(entries)? != FLOWSEAL_TREE_SHA256 {
-        return Err(fail(
-            "Manifest не совпадает с закреплённым набором Flowseal",
-        ));
-    }
-    let expected = expected_files();
+    let expected: BTreeSet<_> = checked_manifest(&manifest_bytes)?.into_iter().collect();
+    let entries = manifest["files"]
+        .as_array()
+        .ok_or_else(|| fail("Manifest без files"))?;
     let mut recorded = BTreeSet::new();
     for entry in entries {
         let relative = entry
@@ -302,7 +313,7 @@ pub fn validate_bundle(paths: &AppPaths) -> Result<Bundle> {
         return Err(fail("Manifest не содержит полный набор файлов"));
     }
     let (actual_files, actual_directories) = inspect_tree(root)?;
-    let mut expected_with_manifest = expected;
+    let mut expected_with_manifest = expected.clone();
     expected_with_manifest.insert(MANIFEST.to_string());
     let expected_directories = BTreeSet::from([
         "assets".to_string(),
@@ -315,6 +326,14 @@ pub fn validate_bundle(paths: &AppPaths) -> Result<Bundle> {
         return Err(fail("Bundle содержит неожиданные или отсутствующие пути"));
     }
     let mut bundle = Bundle::at(root.clone());
+    bundle.files = expected.into_iter().collect();
+    bundle.strategy_names = bundle
+        .files
+        .iter()
+        .filter_map(|s| s.strip_prefix("strategies/").map(str::to_string))
+        .collect();
+    bundle.strategy_count = bundle.strategy_names.len();
+    bundle.manifest_bytes = manifest_bytes;
     bundle.reused = true;
     Ok(bundle)
 }
@@ -385,25 +404,23 @@ fn write_payload(stage: &Dir, payload: Vec<app_archive::PayloadFile>) -> Result<
     Ok(manifest)
 }
 
+pub fn validate_config(config: &Config, bundle: &Bundle) -> Result<Value> {
+    if !bundle.strategy_names.contains(&config.strategy) {
+        return Err(fail(format!(
+            "Стратегия отсутствует в bundle: {}",
+            config.strategy
+        )));
+    }
+    let plan = crate::strategy::Plan::load(
+        &bundle.strategies.join(&config.strategy),
+        &bundle.assets,
+        config.gamefiltertcp,
+        config.gamefilterudp,
+    )?;
+    validation::validate_engine(&bundle.nfqws, &plan, Duration::from_secs(10))
+}
 fn dry_run(paths: &AppPaths, bundle: &Bundle) -> Result<Value> {
-    let options = [
-        "--dry-run",
-        "--config",
-        string_path(&paths.config_file)?,
-        "--strategies",
-        string_path(&bundle.strategies)?,
-        "--assets",
-        string_path(&bundle.assets)?,
-        "--nfqws",
-        string_path(&bundle.nfqws)?,
-        "--timeout-ms",
-        "10000",
-    ];
-    let result = validation::run(&options)?;
-    Ok(result
-        .get("validation")
-        .cloned()
-        .unwrap_or_else(|| json!({"status": "passed"})))
+    validate_config(&paths.load_config()?, bundle)
 }
 
 fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bundle> {
@@ -421,31 +438,39 @@ fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bun
         let files = write_payload(&stage, payload)?;
         let engine = app_archive::engine_spec()?;
         let manifest = json!({
-            "schema": 1,
+            "schema": 2,
             "nfqws_archive_sha256": NFQWS_SHA256,
-            "strategies_archive_sha256": STRATEGIES_SHA256,
+            "source": archives.source,
             "engine_arch": std::env::consts::ARCH,
             "engine_sha256": engine.sha256,
             "files": files,
         });
-        if flowseal_tree_digest(manifest["files"].as_array().unwrap_or(&Vec::new()))?
-            != FLOWSEAL_TREE_SHA256
-        {
-            return Err(fail(
-                "Извлечённые файлы не совпадают с закреплённым набором Flowseal",
-            ));
-        }
         let manifest_bytes =
             serde_json::to_vec_pretty(&manifest).map_err(|error| fail(error.to_string()))?;
         stage
             .write(MANIFEST, &manifest_bytes, 0o600)
             .map_err(|error| fail(error.message))?;
-        let staged = Bundle::at(stage_real.clone());
+        let mut candidate_paths = paths.clone();
+        candidate_paths.bundle_dir = stage_real.clone();
+        let staged = validate_bundle(&candidate_paths)?;
         let validation = dry_run(paths, &staged)?;
-        data.rename(&stage_name, &data, "bundle")
-            .map_err(|error| fail(error.message))?;
-        let mut bundle = validate_bundle(paths)?;
-        bundle.reused = false;
+        let generation = format!("bundle-{}", digest(&manifest_bytes));
+        let generation_path = paths.data_dir.join(&generation);
+        let reused = data.exists(&generation)?;
+        if reused {
+            candidate_paths.bundle_dir = generation_path.clone();
+            if validate_bundle(&candidate_paths)?.manifest_bytes != manifest_bytes {
+                return Err(fail("Существующее поколение конфликтует с кандидатом"));
+            }
+            fs::remove_dir_all(&stage_real).map_err(|e| fail(e.to_string()))?;
+        } else {
+            data.rename(&stage_name, &data, &generation)?;
+        }
+        // Generation is retained even if the pointer rename succeeds but its fsync fails.
+        paths.publish_bundle(&generation)?;
+        candidate_paths.bundle_dir = generation_path;
+        let mut bundle = validate_bundle(&candidate_paths)?;
+        bundle.reused = reused;
         bundle.validation = validation;
         Ok(bundle)
     })();
@@ -457,6 +482,12 @@ fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bun
 }
 
 pub fn setup(paths: &AppPaths, archive_dir: Option<&Path>) -> Result<Bundle> {
+    prepare(paths, archive_dir, false)
+}
+pub fn update(paths: &AppPaths, archive_dir: Option<&Path>) -> Result<Bundle> {
+    prepare(paths, archive_dir, true)
+}
+fn prepare(paths: &AppPaths, archive_dir: Option<&Path>, refresh: bool) -> Result<Bundle> {
     if unsafe { libc::geteuid() } == 0 {
         return Err(AppError::new(
             "permissions",
@@ -466,14 +497,17 @@ pub fn setup(paths: &AppPaths, archive_dir: Option<&Path>) -> Result<Bundle> {
     paths.ensure_private_dirs()?;
     let _lock = lock(paths)?;
     paths.load_or_create_config()?;
-    let data = Dir::absolute(&paths.data_dir, false, false).map_err(|error| fail(error.message))?;
-    if data.exists("bundle").map_err(|error| fail(error.message))? {
-        let mut bundle = validate_bundle(paths)?;
-        bundle.validation = dry_run(paths, &bundle)?;
-        return Ok(bundle);
+    let mut paths = paths.clone();
+    paths.bundle_dir = paths.active_bundle()?;
+    if fs::symlink_metadata(&paths.bundle_dir).is_ok() {
+        let mut bundle = validate_bundle(&paths)?;
+        if !refresh {
+            bundle.validation = dry_run(&paths, &bundle)?;
+            return Ok(bundle);
+        }
     }
-    let archives = app_archive::acquire(paths, archive_dir)?;
-    build_bundle(paths, archives)
+    let archives = app_archive::acquire(&paths, archive_dir)?;
+    build_bundle(&paths, archives)
 }
 
 fn command_version(path: &Path) -> Option<String> {
@@ -567,24 +601,38 @@ pub fn ui(options: &[&str]) -> Result<Value> {
     match options {
         ["paths"] => Ok(json!({"paths": paths.json()})),
         ["doctor"] | ["doctor", "--json"] => Ok(json!({"doctor": doctor(&paths)})),
-        ["setup"] | ["setup", "--json"] => {
-            let bundle = setup(&paths, None)?;
+        [action @ ("setup" | "update")] | [action @ ("setup" | "update"), "--json"] => {
+            let bundle = prepare(&paths, None, *action == "update")?;
             let config: Config = paths.load_config()?;
             Ok(json!({"config": config.json(), "bundle": bundle.json()}))
         }
-        ["setup", "--archive-dir", directory]
-        | ["setup", "--archive-dir", directory, "--json"]
-        | ["setup", "--json", "--archive-dir", directory] => {
-            let bundle = setup(&paths, Some(Path::new(directory)))?;
+        [action @ ("setup" | "update"), "--archive-dir", directory]
+        | [
+            action @ ("setup" | "update"),
+            "--archive-dir",
+            directory,
+            "--json",
+        ]
+        | [
+            action @ ("setup" | "update"),
+            "--json",
+            "--archive-dir",
+            directory,
+        ] => {
+            let bundle = if *action == "update" {
+                update(&paths, Some(Path::new(directory)))?
+            } else {
+                setup(&paths, Some(Path::new(directory)))?
+            };
             let config: Config = paths.load_config()?;
             Ok(json!({"config": config.json(), "bundle": bundle.json()}))
         }
         _ => Err(AppError::new(
             "usage",
             format!(
-                "ui setup [--archive-dir DIR] | ui doctor | ui paths; offline names: {}, {}",
+                "ui setup|update [--archive-dir DIR] | ui doctor | ui paths; offline names: {}, {}",
                 app_archive::NFQWS_ARCHIVE_NAME,
-                app_archive::STRATEGIES_ARCHIVE_NAME
+                "flowseal.tar.gz (or strategies-<revision>.tar.gz)"
             ),
         )),
     }

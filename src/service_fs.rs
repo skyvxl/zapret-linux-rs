@@ -46,6 +46,15 @@ pub fn path_ok(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// Stable owned-data format; producers may impose narrower size/suffix rules.
+pub fn owned_data_basename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.starts_with('.')
+        && !value
+            .chars()
+            .any(|c| c.is_control() || "/\\:\"'<>|?*".contains(c))
+}
 fn name(value: &str) -> Result<CString> {
     if value.is_empty()
         || value.contains('/')
