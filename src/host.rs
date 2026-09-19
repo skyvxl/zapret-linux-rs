@@ -68,7 +68,7 @@ pub fn run(args: &[&str]) -> Result<Value> {
         || nft["queues"].as_array().is_some_and(|entries| {
             entries
                 .iter()
-                .any(|entry| entry["conflicts_with_queue220"] == true)
+                .any(|entry| entry["conflicts_with_queue220"] == true || entry["kind"] == "xt")
         });
     Ok(json!({"host": {
         "status": if conflict { "conflicts" } else if complete { "clear" } else { "incomplete" },
@@ -327,6 +327,236 @@ fn family(value: &Value) -> bool {
         .is_some_and(|family| ["inet", "ip", "ip6", "arp", "bridge", "netdev"].contains(&family))
 }
 
+// libnftables-json(5): statements that cannot enqueue packets are inspected
+// by their documented outer shape, not by reimplementing firewall semantics.
+fn fields(body: &Value, allowed: &[&str]) -> bool {
+    body.as_object()
+        .is_some_and(|object| object.keys().all(|key| allowed.contains(&key.as_str())))
+}
+
+fn optional(body: &Value, key: &str, valid: impl FnOnce(&Value) -> bool) -> bool {
+    body.get(key).is_none_or(valid)
+}
+
+fn nonnull(value: &Value) -> bool {
+    !value.is_null()
+}
+
+fn flags(value: &Value, allowed: &[&str]) -> bool {
+    let valid = |v: &Value| v.as_str().is_some_and(|s| allowed.contains(&s));
+    valid(value)
+        || value
+            .as_array()
+            .is_some_and(|items| items.iter().all(valid))
+}
+
+pub(crate) fn diagnostic_label(value: &str) -> String {
+    value
+        .chars()
+        .take(64)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+#[derive(Default)]
+struct Statements {
+    queues: Vec<Value>,
+    malformed: bool,
+    unsupported: bool,
+    dynamic: bool,
+    details: BTreeSet<String>,
+}
+
+impl Statements {
+    fn detail(&mut self, message: String) {
+        if self.details.len() < 8 {
+            self.details.insert(message);
+        }
+    }
+
+    fn inspect(&mut self, statement: &Value, rule: &Value, depth: usize) {
+        if depth > 32 {
+            self.unsupported = true;
+            self.detail("statement nesting limit".into());
+            return;
+        }
+        let Some(object) = statement.as_object().filter(|o| o.len() == 1) else {
+            self.malformed = true;
+            self.detail("malformed statement".into());
+            return;
+        };
+        let (kind, body) = object.iter().next().expect("one statement");
+        let valid = match kind.as_str() {
+            "queue" => {
+                let (item, valid, uncertain) = inspect_queue(body, rule);
+                self.queues.push(item);
+                self.dynamic |= uncertain;
+                if uncertain {
+                    self.detail("dynamic queue".into());
+                }
+                valid
+            }
+            "accept" | "drop" | "continue" | "return" | "notrack" => body.is_null(),
+            "jump" | "goto" => fields(body, &["target"]) && name(body, "target"),
+            "counter" => {
+                fields(body, &["packets", "bytes"])
+                    && body["packets"].as_u64().is_some()
+                    && body["bytes"].as_u64().is_some()
+            }
+            "match" => {
+                fields(body, &["op", "left", "right"])
+                    && name(body, "op")
+                    && body.get("left").is_some_and(nonnull)
+                    && body.get("right").is_some_and(nonnull)
+            }
+            "xt" => {
+                if !fields(body, &["type", "name"]) || !name(body, "type") || !name(body, "name") {
+                    false
+                } else {
+                    let target = body["name"].as_str().unwrap();
+                    match body["type"].as_str().unwrap() {
+                        // xt matches return a match result, never a verdict.
+                        "match" => true,
+                        "target" if matches!(target, "NFQUEUE" | "QUEUE") => {
+                            // Compat JSON omits the target payload, including queue number.
+                            self.queues.push(
+                                json!({"family": rule["family"], "table": rule["table"],
+                                "chain": rule["chain"], "kind": "xt", "target": target,
+                                "conflicts_with_queue220": null}),
+                            );
+                            self.dynamic = true;
+                            self.detail(format!("xt target {target}: queue number unavailable"));
+                            true
+                        }
+                        "target"
+                            if matches!(
+                                target,
+                                "LOG" | "REJECT" | "DNAT" | "SNAT" | "MASQUERADE" | "REDIRECT"
+                            ) =>
+                        {
+                            true
+                        }
+                        "target" | "watcher" => {
+                            self.unsupported = true;
+                            self.detail(format!(
+                                "xt {} {}",
+                                diagnostic_label(body["type"].as_str().unwrap()),
+                                diagnostic_label(target)
+                            ));
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            }
+            "limit" => {
+                fields(
+                    body,
+                    &["rate", "rate_unit", "per", "burst", "burst_unit", "inv"],
+                ) && body["rate"].as_u64().is_some()
+                    && name(body, "per")
+                    && optional(body, "burst", |v| v.as_u64().is_some())
+                    && optional(body, "inv", Value::is_boolean)
+                    && optional(body, "rate_unit", Value::is_string)
+                    && optional(body, "burst_unit", Value::is_string)
+            }
+            "log" => {
+                body.is_null()
+                    || (fields(
+                        body,
+                        &[
+                            "prefix",
+                            "group",
+                            "snaplen",
+                            "queue-threshold",
+                            "level",
+                            "flags",
+                        ],
+                    ) && optional(body, "prefix", Value::is_string)
+                        && ["group", "snaplen", "queue-threshold"]
+                            .iter()
+                            .all(|k| optional(body, k, |v| v.as_u64().is_some()))
+                        && optional(body, "level", |v| {
+                            flags(
+                                v,
+                                &[
+                                    "emerg", "alert", "crit", "err", "warn", "notice", "info",
+                                    "debug", "audit",
+                                ],
+                            ) && v.is_string()
+                        })
+                        && optional(body, "flags", |v| {
+                            flags(
+                                v,
+                                &[
+                                    "tcp sequence",
+                                    "tcp options",
+                                    "ip options",
+                                    "skuid",
+                                    "ether",
+                                    "all",
+                                ],
+                            )
+                        }))
+            }
+            "reject" => {
+                body.is_null()
+                    || (fields(body, &["type", "expr"])
+                        && optional(body, "type", |v| {
+                            v.as_str().is_some_and(|s| {
+                                ["tcp reset", "icmpx", "icmp", "icmpv6"].contains(&s)
+                            })
+                        })
+                        && optional(body, "expr", nonnull))
+            }
+            "snat" | "dnat" | "masquerade" | "redirect" => {
+                let address = matches!(kind.as_str(), "snat" | "dnat");
+                (!address && body.is_null())
+                    || (fields(
+                        body,
+                        if address {
+                            &["addr", "family", "port", "flags"]
+                        } else {
+                            &["port", "flags"]
+                        },
+                    ) && optional(body, "addr", nonnull)
+                        && optional(body, "port", nonnull)
+                        && optional(body, "family", |v| {
+                            v.as_str().is_some_and(|s| ["ip", "ip6"].contains(&s))
+                        })
+                        && optional(body, "flags", |v| {
+                            flags(v, &["random", "fully-random", "persistent"])
+                        }))
+            }
+            "mangle" => {
+                fields(body, &["key", "value"])
+                    && body.get("key").is_some_and(Value::is_object)
+                    && body.get("value").is_some_and(nonnull)
+            }
+            "meter" => {
+                // Unlike ordinary expressions, stmt contains an executable statement.
+                // Inspect it even if another meter property is malformed.
+                if let Some(nested) = body.get("stmt") {
+                    self.inspect(nested, rule, depth + 1);
+                }
+                fields(body, &["name", "key", "stmt"])
+                    && name(body, "name")
+                    && body.get("key").is_some_and(nonnull)
+                    && body.get("stmt").is_some()
+            }
+            _ => {
+                self.unsupported = true;
+                self.detail(format!("statement {}", diagnostic_label(kind)));
+                true
+            }
+        };
+        if !valid {
+            self.malformed = true;
+            self.detail(format!("malformed {}", diagnostic_label(kind)));
+        }
+    }
+}
+
 fn inspect_ruleset(value: &Value) -> Value {
     let Some(entries) = value
         .as_object()
@@ -337,12 +567,11 @@ fn inspect_ruleset(value: &Value) -> Value {
         return nft_failure("malformed", "Expected one nftables array");
     };
     let mut known_tables = Vec::new();
-    let mut queues = Vec::new();
+    let mut inspected = Statements::default();
     let mut tables = BTreeSet::new();
     let mut chains = BTreeSet::new();
     let mut malformed = false;
-    let mut unsupported = false;
-    let mut dynamic = false;
+
     for entry in entries {
         let Some(object) = entry.as_object().filter(|o| o.len() == 1) else {
             malformed = true;
@@ -399,36 +628,13 @@ fn inspect_ruleset(value: &Value) -> Value {
                     continue;
                 };
                 for statement in statements {
-                    let Some(object) = statement.as_object().filter(|o| o.len() == 1) else {
-                        malformed = true;
-                        continue;
-                    };
-                    let (kind, body) = object.iter().next().expect("one statement");
-                    match kind.as_str() {
-                        "queue" => {
-                            let (item, valid, uncertain) = inspect_queue(body, data);
-                            queues.push(item);
-                            malformed |= !valid;
-                            dynamic |= uncertain;
-                        }
-                        "accept" | "drop" | "continue" | "return" => malformed |= !body.is_null(),
-                        "jump" | "goto" => malformed |= !body.is_object() || !name(body, "target"),
-                        "counter" => {
-                            malformed |= !body.is_object()
-                                || body["packets"].as_u64().is_none()
-                                || body["bytes"].as_u64().is_none()
-                        }
-                        "match" => {
-                            malformed |= !body.is_object()
-                                || !name(body, "op")
-                                || body.get("left").is_none_or(Value::is_null)
-                                || body.get("right").is_none_or(Value::is_null)
-                        }
-                        _ => unsupported = true,
-                    }
+                    inspected.inspect(statement, data, 0);
                 }
             }
-            _ => unsupported = true,
+            _ => {
+                inspected.unsupported = true;
+                inspected.detail(format!("object {}", diagnostic_label(kind)));
+            }
         }
     }
     for (family, table, _) in &chains {
@@ -445,9 +651,13 @@ fn inspect_ruleset(value: &Value) -> Value {
             malformed |= !chains.contains(&(f, t, c));
         }
     }
+    malformed |= inspected.malformed;
+    let unsupported = inspected.unsupported;
+    let dynamic = inspected.dynamic;
     let complete = !malformed && !unsupported && !dynamic;
     json!({"status": if malformed { "malformed" } else if unsupported || dynamic { "incomplete" } else { "inspected" },
-        "complete": complete, "known_tables": known_tables, "queues": queues,
+        "complete": complete, "known_tables": known_tables, "queues": inspected.queues,
+        "inspection_details": inspected.details,
         "unsupported_objects_or_statements": unsupported, "dynamic_queues": dynamic,
         "diagnostic": if malformed { Some("Invalid nft object structure or references") } else if unsupported || dynamic {
             Some("Unsupported nft objects/statements or a dynamic queue prevent complete inspection")

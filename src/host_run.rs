@@ -77,20 +77,49 @@ pub fn check_interface(name: &str) -> Result<()> {
 
 pub fn preflight(nft: &Path, ipv4: &Path, ipv6: &Path, timeout: Duration) -> Result<()> {
     let report = host::inspect_nft(nft, timeout);
-    if report["complete"] != true {
+    let mut conflicts = Vec::new();
+    if let Some(tables) = report["known_tables"].as_array() {
+        for table in tables.iter().take(4) {
+            conflicts.push(format!(
+                "таблица {} {}",
+                host::diagnostic_label(table["family"].as_str().unwrap_or("?")),
+                host::diagnostic_label(table["name"].as_str().unwrap_or("?"))
+            ));
+        }
+    }
+    if report["queues"].as_array().is_some_and(|v| !v.is_empty()) {
+        conflicts.push("правила NFQUEUE".into());
+    }
+    // Positive evidence is actionable even when some unrelated rules are unknown.
+    if !conflicts.is_empty() {
         return Err(fail(format!(
-            "Не удалось полностью проверить nft ruleset: {}",
-            report["status"]
+            "Конфликт в текущей сети: {}. Остановите предыдущий zapret через его собственное меню и повторите запуск; если правила NFQUEUE принадлежат другой программе, сначала устраните конфликт в ней.",
+            conflicts.join(", ")
         )));
     }
-    if report["known_tables"]
-        .as_array()
-        .is_none_or(|v| !v.is_empty())
-        || report["queues"].as_array().is_none_or(|v| !v.is_empty())
-    {
-        return Err(fail(
-            "В текущей сети уже есть таблицы zapret или правила NFQUEUE",
-        ));
+    if report["complete"] != true {
+        let details = report["inspection_details"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .take(8)
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                report["diagnostic"]
+                    .as_str()
+                    .unwrap_or("причина неизвестна")
+                    .to_owned()
+            });
+        return Err(fail(format!(
+            "Не удалось полностью проверить nft ruleset: {}. {}",
+            report["status"].as_str().unwrap_or("unknown"),
+            details
+        )));
     }
     for (binary, applet) in [
         (ipv4, "iptables-legacy-save"),
