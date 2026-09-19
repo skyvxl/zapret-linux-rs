@@ -17,8 +17,7 @@ fn supports_screen() -> bool {
 }
 pub fn redraw() {
     if supports_screen() {
-        // ED 2 clears the visible screen while leaving terminal scrollback intact.
-        print!("\x1b[2J\x1b[H");
+        print!("\x1b[2J\x1b[H\x1b[3J");
     }
 }
 pub fn title(text: &str) {
