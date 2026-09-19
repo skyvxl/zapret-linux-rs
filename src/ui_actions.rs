@@ -1,14 +1,15 @@
-//! Guided actions resolve inputs once, then reuse the checked core authorities.
 use crate::{
     app_archive,
     app_paths::AppPaths,
     app_setup,
     config::Config,
     diagnose,
-    error::{AppError, Result},
+    error::{AppError, Result, combine},
     lifecycle, output, service_cli,
     service_fs::{self, Dir},
-    state_cli, ui_terminal,
+    state_cli,
+    state_dir::{Lease, StateDir},
+    ui_terminal,
 };
 use std::{
     fs::File,
@@ -73,7 +74,6 @@ pub fn launch(action: &str, service: Option<&str>) -> Result<()> {
         Command::new(exe)
     } else {
         let mut command = Command::new(tool("sudo")?);
-        // Noninteractive actions never wait for invisible authentication.
         if !ui_terminal::is_terminal() {
             command.arg("-n");
         }
@@ -133,7 +133,7 @@ fn manual_state() -> Result<(Dir, File)> {
     }
     Ok((dir, lock))
 }
-fn recover() -> Result<()> {
+fn recover(state: &Dir) -> Result<()> {
     let nft = tool("nft")?;
     let result = state_cli::run(&[
         "recover",
@@ -143,6 +143,7 @@ fn recover() -> Result<()> {
         path(&nft)?,
         "--allow-previous-boot",
     ])?;
+    clean_recovered(state)?;
     println!(
         "Ручное состояние: {}; очистка: {}",
         result["state"]["status"].as_str().unwrap_or("unknown"),
@@ -179,8 +180,7 @@ fn bundle_files() -> Vec<String> {
     files
 }
 const DIRS: &[&str] = &["bin", "strategies", "assets", "assets/bin", "assets/lists"];
-/// Only fixed expected basenames enter a new, exclusively owned root directory.
-/// Revalidate the root copy against pinned digests before executing any engine.
+/// Revalidate the private root copy before executing any engine.
 fn snapshot(
     state: &Dir,
     config: &Path,
@@ -241,84 +241,139 @@ fn snapshot(
     })();
     match result {
         Ok((p, b)) => Ok((name, p, b)),
-        Err(e) => {
-            let _ = remove_snapshot(state, &name, false);
-            Err(e)
-        }
+        Err(e) => combine(Err(e), remove_snapshot(state, &name)),
     }
 }
-/// Never delete by prefix alone: root ownership, exact marker and a fixed
-/// allowlist are checked. Unknown content is preserved for inspection.
-fn remove_snapshot(state: &Dir, name: &str, complete: bool) -> Result<()> {
-    let suffix = name
-        .strip_prefix("inputs-")
-        .ok_or_else(|| fail("Неизвестный snapshot"))?;
-    if suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(fail("Некорректный идентификатор snapshot"));
-    }
-    let stage = state.child(name)?;
-    private(&stage)?;
-    if stage.read("owner", 0o600, 100)? != name.as_bytes() {
-        return Err(fail("Snapshot не принадлежит этому действию"));
-    }
-    if complete {
-        app_setup::validate_bundle(&staged_paths(&Path::new(MANUAL_STATE).join(name)))?;
-    }
-    let mut allowed = bundle_files()
-        .into_iter()
-        .map(|p| format!("bundle/{p}"))
-        .collect::<Vec<_>>();
-    allowed.extend(["owner".into(), "config.env".into()]);
-    let mut dirs = DIRS
-        .iter()
-        .map(|d| format!("bundle/{d}"))
-        .collect::<Vec<_>>();
-    dirs.push("bundle".into());
-    fn check(dir: &Dir, prefix: &str, files: &[String], dirs: &[String]) -> Result<()> {
-        private(dir)?;
-        for name in dir.names()? {
-            let rel = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if dirs.contains(&rel) {
-                check(&dir.child(&name)?, &rel, files, dirs)?;
-            } else if files.contains(&rel) {
-                let f = dir.open(&name, libc::O_RDONLY, 0)?;
-                service_fs::trusted_file(
-                    &f,
-                    if rel == "bundle/bin/nfqws" {
-                        0o700
+/// Ownership and constrained directory roles authorize deletion, independently
+/// of the runnable bundle/catalog. Validate everything before deleting; owner last.
+fn remove_snapshot(state: &Dir, name: &str) -> Result<()> {
+    let result = (|| {
+        let suffix = name
+            .strip_prefix("inputs-")
+            .ok_or_else(|| fail("Неизвестный snapshot"))?;
+        if suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(fail("Некорректный идентификатор snapshot"));
+        }
+        let stage = state.child(name)?;
+        private(&stage)?;
+        if stage.names()?.is_empty() {
+            return state.unlink(name, true);
+        }
+        if stage
+            .read("owner", 0o600, 100)
+            .map_err(|e| fail(format!("owner: {}", e.message)))?
+            != name.as_bytes()
+        {
+            return Err(fail("owner: Snapshot не принадлежит этому действию"));
+        }
+        fn basename(name: &str) -> bool {
+            name.len() <= 255
+                && name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b" ._()-".contains(&b))
+        }
+        fn directory(prefix: &str, name: &str) -> bool {
+            matches!(
+                (prefix, name),
+                ("", "bundle")
+                    | ("bundle", "bin" | "strategies" | "assets")
+                    | ("bundle/assets", "bin" | "lists")
+            )
+        }
+        fn check(dir: &Dir, prefix: &str, remaining: &mut usize) -> Result<()> {
+            private(dir)?;
+            for name in dir.names()? {
+                let rel = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let result = (|| {
+                    *remaining = remaining
+                        .checked_sub(1)
+                        .ok_or_else(|| fail("Превышен лимит 4096 записей snapshot"))?;
+                    if directory(prefix, &name) {
+                        check(&dir.child(&name)?, &rel, remaining)
                     } else {
-                        0o600
-                    },
-                )?;
-            } else {
-                return Err(fail("Неожиданный файл в snapshot; каталог сохранён"));
+                        let allowed = match prefix {
+                            "" => ["owner", "config.env"].contains(&name.as_str()),
+                            "bundle" => name == "manifest.json",
+                            "bundle/bin" => name == "nfqws",
+                            "bundle/strategies" => basename(&name) && name.ends_with(".bat"),
+                            "bundle/assets/bin" | "bundle/assets/lists" => basename(&name),
+                            _ => false,
+                        };
+                        if !allowed {
+                            return Err(fail("Неизвестная роль файла/каталога"));
+                        }
+                        let f = dir.open(&name, libc::O_RDONLY, 0)?;
+                        service_fs::trusted_file(
+                            &f,
+                            if rel == "bundle/bin/nfqws" {
+                                0o700
+                            } else {
+                                0o600
+                            },
+                        )
+                    }
+                })();
+                result.map_err(|e| fail(format!("{rel}: {}", e.message)))?;
             }
+            Ok(())
         }
-        Ok(())
-    }
-    check(&stage, "", &allowed, &dirs)?;
-    fn remove(dir: &Dir) -> Result<()> {
-        for name in dir.names()? {
-            if let Ok(child) = dir.child(&name) {
-                remove(&child)?;
-                dir.unlink(&name, true)?;
-            } else {
-                dir.unlink(&name, false)?;
+        check(&stage, "", &mut 4096)?;
+        fn remove(dir: &Dir, prefix: &str) -> Result<()> {
+            for name in dir.names()? {
+                if prefix.is_empty() && name == "owner" {
+                    continue;
+                }
+                let rel = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let result = if directory(prefix, &name) {
+                    remove(&dir.child(&name)?, &rel).and_then(|()| dir.unlink(&name, true))
+                } else {
+                    dir.unlink(&name, false)
+                };
+                result.map_err(|e| fail(format!("{rel}: {}", e.message)))?;
             }
+            Ok(())
         }
-        Ok(())
+        remove(&stage, "")?;
+        stage
+            .unlink("owner", false)
+            .map_err(|e| fail(format!("owner: {}", e.message)))?;
+        state.unlink(name, true)
+    })();
+    result.map_err(|e| {
+        fail(format!(
+            "{MANUAL_STATE}/{name}: очистка снимка не подтверждена: {}",
+            e.message
+        ))
+    })
+}
+fn empty_manual_state() -> Result<Lease> {
+    // Core writes the journal before spawning and clears it only after removing
+    // rules and reaping. Hold its lock through deletion, including preflight errors.
+    let lease = StateDir::open(Path::new(MANUAL_STATE))?.lock()?;
+    if lease.read()?.is_some() {
+        return Err(fail(
+            "Очистка runtime не подтверждена: журнал состояния сохранён",
+        ));
     }
-    remove(&stage)?;
-    state.unlink(name, true)
+    Ok(lease)
 }
 fn clean_recovered(state: &Dir) -> Result<()> {
+    let _lease = empty_manual_state()?;
     for name in state.names()? {
         if name.starts_with("inputs-") {
-            remove_snapshot(state, &name, true)?;
+            remove_snapshot(state, &name)?;
         }
     }
     Ok(())
@@ -376,8 +431,7 @@ pub fn worker(args: &[&str]) -> Result<()> {
     }
     let (state, _lock) = manual_state()?;
     if action != "service" {
-        recover()?;
-        clean_recovered(&state)?;
+        recover(&state)?;
     }
     let Some((config, bundle)) = inputs else {
         return Ok(());
@@ -408,15 +462,22 @@ pub fn worker(args: &[&str]) -> Result<()> {
             diagnose::run(&args.iter().map(String::as_str).collect::<Vec<_>>())
         }
     })();
-    if result.is_ok() {
-        remove_snapshot(&state, &name, true)?;
-    } else {
+    let cleanup = (|| {
+        // Installation owns a separate immutable copy and its own journal.
+        let _lease = if action == "service" {
+            None
+        } else {
+            Some(empty_manual_state()?)
+        };
+        remove_snapshot(&state, &name)
+    })();
+    if cleanup.is_err() {
         eprintln!(
-            "Снимок входных данных сохранён: {}. После устранения причины: ./service.sh recover",
+            "Не подтверждена очистка входных данных: {}. После устранения причины: ./service.sh recover",
             paths.data_dir.display()
         );
     }
-    result
+    combine(result, cleanup)
 }
 fn show_service(value: serde_json::Value) -> Result<()> {
     let s = &value["service"];

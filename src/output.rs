@@ -40,12 +40,29 @@ fn render(value: &Value) -> String {
             value["strategy_order"].as_array().map_or(0, Vec::len)
         ),
         Some("strategy_ready") => format!("Проверяется: {}\n", text("strategy")),
-        Some("strategy_complete") => format!(
-            "{}: {} (очистка: {})\n",
-            value["result"]["strategy"],
-            value["result"]["status"],
-            value["result"]["cleanup_confirmed"]
-        ),
+        Some("strategy_complete") => {
+            let result = &value["result"];
+            let mut line = format!(
+                "{}: {} (очистка: {})\n",
+                result["strategy"], result["status"], result["cleanup_confirmed"]
+            );
+            if result["status"] == "failed"
+                && let Some(error) = result["error"].as_object()
+            {
+                line.push_str(&format!(
+                    "Ошибка ({}): {}\n",
+                    error
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ));
+            }
+            line
+        }
         Some("diagnosis_complete") => format!(
             "Диагностика: {}. TCP прошли: {}. QUIC прошли: {}.\nПроверена HTTP-доступность; воспроизведение видео и голос не проверялись.\n",
             value["report"]["status"],

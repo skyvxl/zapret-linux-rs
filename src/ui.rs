@@ -1,4 +1,3 @@
-//! Russian guided frontend. Legacy commands keep their original JSON contract.
 use crate::{
     app_archive,
     app_paths::AppPaths,

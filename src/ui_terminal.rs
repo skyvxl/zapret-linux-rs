@@ -1,4 +1,3 @@
-//! Canonical terminal input and scoped supervision of interactive subprocesses.
 use crate::{
     error::{AppError, Result},
     signals::Signals,

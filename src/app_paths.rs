@@ -255,7 +255,6 @@ impl AppPaths {
         Config::parse(&text)
     }
 
-    #[allow(dead_code)]
     pub fn save_config(&self, config: &Config) -> Result<()> {
         let directory = open_or_create_private(&self.config_dir)?;
         if directory
