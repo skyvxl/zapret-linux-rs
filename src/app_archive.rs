@@ -135,13 +135,15 @@ fn download(paths: &AppPaths, name: &str, url: &str, limit: u64, digest: &str) -
         .arg(&temporary)
         .arg("--url")
         .arg(url);
-    let output = match process::capture(command, &[], Duration::from_secs(185)) {
-        Ok(output) => output,
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
-        }
-    };
+    let signals = crate::signals::Signals::install()?;
+    let output =
+        match process::capture_interruptible(command, &[], Duration::from_secs(185), &signals) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        };
     if !output.status.success() {
         let _ = fs::remove_file(&temporary);
         return Err(fail(format!(

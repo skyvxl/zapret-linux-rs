@@ -5,7 +5,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Auto,
     Nftables,
@@ -22,7 +22,7 @@ impl Backend {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub interface: String,
     pub gamefiltertcp: bool,

@@ -423,7 +423,13 @@ fn dry_run(paths: &AppPaths, bundle: &Bundle) -> Result<Value> {
     validate_config(&paths.load_config()?, bundle)
 }
 
-fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bundle> {
+fn build_bundle(
+    paths: &AppPaths,
+    archives: app_archive::Archives,
+    allow_missing_selection: bool,
+) -> Result<Bundle> {
+    let signals = crate::signals::Signals::install()?;
+    signals.check()?;
     let data = Dir::absolute(&paths.data_dir, false, false).map_err(|error| fail(error.message))?;
     let stage_name = format!(
         ".bundle-stage-{}",
@@ -453,7 +459,18 @@ fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bun
         let mut candidate_paths = paths.clone();
         candidate_paths.bundle_dir = stage_real.clone();
         let staged = validate_bundle(&candidate_paths)?;
-        let validation = dry_run(paths, &staged)?;
+        let mut config = paths.load_config()?;
+        if allow_missing_selection && !staged.strategy_names.contains(&config.strategy) {
+            // Validate the new engine/catalog without changing the user's saved selection.
+            // The TUI asks for a new choice after publication; running services keep their snapshot.
+            config.strategy = staged
+                .strategy_names
+                .first()
+                .ok_or_else(|| fail("В новом наборе нет стратегий"))?
+                .clone();
+        }
+        let validation = validate_config(&config, &staged)?;
+        signals.check()?;
         let generation = format!("bundle-{}", digest(&manifest_bytes));
         let generation_path = paths.data_dir.join(&generation);
         let reused = data.exists(&generation)?;
@@ -467,6 +484,7 @@ fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bun
             data.rename(&stage_name, &data, &generation)?;
         }
         // Generation is retained even if the pointer rename succeeds but its fsync fails.
+        signals.check()?;
         paths.publish_bundle(&generation)?;
         candidate_paths.bundle_dir = generation_path;
         let mut bundle = validate_bundle(&candidate_paths)?;
@@ -482,18 +500,28 @@ fn build_bundle(paths: &AppPaths, archives: app_archive::Archives) -> Result<Bun
 }
 
 pub fn setup(paths: &AppPaths, archive_dir: Option<&Path>) -> Result<Bundle> {
-    prepare(paths, archive_dir, false)
+    prepare(paths, archive_dir, false, false)
 }
 pub fn update(paths: &AppPaths, archive_dir: Option<&Path>) -> Result<Bundle> {
-    prepare(paths, archive_dir, true)
+    prepare(paths, archive_dir, true, false)
 }
-fn prepare(paths: &AppPaths, archive_dir: Option<&Path>, refresh: bool) -> Result<Bundle> {
+pub fn update_catalog(paths: &AppPaths, archive_dir: Option<&Path>) -> Result<Bundle> {
+    prepare(paths, archive_dir, true, true)
+}
+fn prepare(
+    paths: &AppPaths,
+    archive_dir: Option<&Path>,
+    refresh: bool,
+    allow_missing_selection: bool,
+) -> Result<Bundle> {
     if unsafe { libc::geteuid() } == 0 {
         return Err(AppError::new(
             "permissions",
             "Подготовку пользовательских данных запускайте без sudo",
         ));
     }
+    let signals = crate::signals::Signals::install()?;
+    signals.check()?;
     paths.ensure_private_dirs()?;
     let _lock = lock(paths)?;
     paths.load_or_create_config()?;
@@ -507,7 +535,8 @@ fn prepare(paths: &AppPaths, archive_dir: Option<&Path>, refresh: bool) -> Resul
         }
     }
     let archives = app_archive::acquire(&paths, archive_dir)?;
-    build_bundle(&paths, archives)
+    signals.check()?;
+    build_bundle(&paths, archives, allow_missing_selection)
 }
 
 fn command_version(path: &Path) -> Option<String> {
@@ -602,7 +631,7 @@ pub fn ui(options: &[&str]) -> Result<Value> {
         ["paths"] => Ok(json!({"paths": paths.json()})),
         ["doctor"] | ["doctor", "--json"] => Ok(json!({"doctor": doctor(&paths)})),
         [action @ ("setup" | "update")] | [action @ ("setup" | "update"), "--json"] => {
-            let bundle = prepare(&paths, None, *action == "update")?;
+            let bundle = prepare(&paths, None, *action == "update", false)?;
             let config: Config = paths.load_config()?;
             Ok(json!({"config": config.json(), "bundle": bundle.json()}))
         }

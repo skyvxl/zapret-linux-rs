@@ -29,6 +29,7 @@ mod service_cli;
 mod service_control;
 mod service_fs;
 mod service_install;
+mod service_status;
 mod service_unit;
 mod signals;
 mod state_cli;
@@ -37,7 +38,14 @@ mod state_record;
 mod strategy;
 mod ui;
 mod ui_actions;
+mod ui_diagnostics;
+mod ui_events;
+mod ui_model;
+mod ui_screens;
+mod ui_settings;
+mod ui_store;
 mod ui_terminal;
+mod ui_tui;
 mod validation;
 
 use error::{AppError, Result};
@@ -60,7 +68,7 @@ fn run() -> Result<()> {
     {
         ["--help"] | ["-h"] => {
             println!(
-                "zapret-linux-rs — запуск и диагностика\n\nui menu | run | diagnose | config | recover | service ACTION\nui setup [--archive-dir DIR] [--json]\nui update [--archive-dir DIR] [--json] (явное обновление стратегий)\nui doctor [--json]\nui paths\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host [--systemd-notify] --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N] [--allow-previous-boot]\ndiagnose --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --curl FILE [--targets FILE] [--quic] [--strategy NAME] [--timeout-ms N] [--probe-timeout-ms N] [--ca-file FILE]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\nservice install --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE [--root DIR] [--enable] [--start]\nservice uninstall|remove [--stop] [--root DIR]\nservice status [--root DIR]\nservice start|stop|restart|enable|disable\n--help"
+                "zapret-linux-rs — запуск и диагностика\n\nui menu | run | diagnose | config | recover | service ACTION\nui setup [--archive-dir DIR] [--json]\nui update [--archive-dir DIR] [--json] (явное обновление стратегий)\nui doctor [--json]\nui paths\nconfig validate FILE\nstrategy explain FILE --assets DIR [-gt] [-gu]\nrun --dry-run --config FILE --strategies DIR --assets DIR --nfqws FILE [--timeout-ms N]\nrun --isolated --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE [--timeout-ms N] [--run-for-ms N] [--state-dir DIR]\nrun --host [--systemd-notify] --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR [--run-for-ms N] [--timeout-ms N]\nfirewall plan --config FILE --strategies DIR --assets DIR\nfirewall verify --config FILE --strategies DIR --assets DIR --nft FILE [--timeout-ms N]\nhost inspect --nft FILE [--timeout-ms N]\nstate inspect --state-dir DIR\nstate recover --state-dir DIR --nft FILE [--timeout-ms N] [--allow-previous-boot]\ndiagnose --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE --state-dir DIR --curl FILE [--targets FILE] [--quic] [--strategy NAME] [--timeout-ms N] [--probe-timeout-ms N] [--ca-file FILE]\nprobe --curl FILE [--targets FILE] [--quic] [--timeout-ms N] [--ca-file FILE]\nservice install --config FILE --strategies DIR --assets DIR --nfqws FILE --nft FILE --iptables-save FILE --ip6tables-save FILE [--root DIR] [--enable] [--start]\nservice uninstall|remove [--stop] [--root DIR]\nservice status [--root DIR]\nservice start|stop|restart|enable|disable\nservice apply (input paths as install; preserves running/enabled)\nservice recover [--root DIR]\n--help"
             );
             Ok(())
         }
@@ -129,6 +137,14 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            // Event workers already sent the complete outcome to the parent.
+            if env::args_os().nth(1).is_some_and(|a| a == "ui")
+                && env::args_os().nth(2).is_some_and(|a| a == "worker")
+                && env::args_os().nth(3).is_some_and(|a| a == "--events")
+                && ["action", "cancelled"].contains(&error.kind)
+            {
+                return ExitCode::from(if error.kind == "cancelled" { 130 } else { 1 });
+            }
             // run() rejects non-UTF-8 argv; error presentation must not decode
             // those same arguments again with the panicking env::args iterator.
             if (env::args_os().nth(1).is_some_and(|a| a == "ui") || env::args_os().len() == 1)
@@ -138,7 +154,11 @@ fn main() -> ExitCode {
             } else {
                 eprintln!("{}", error.json());
             }
-            ExitCode::from(if error.kind == "usage" { 2 } else { 1 })
+            ExitCode::from(match error.kind {
+                "usage" => 2,
+                "cancelled" => 130,
+                _ => 1,
+            })
         }
     }
 }

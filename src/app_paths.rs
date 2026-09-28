@@ -110,13 +110,13 @@ fn open_or_create_private(path: &Path) -> Result<Dir> {
     Ok(directory)
 }
 
-fn private_existing(path: &Path) -> Result<Dir> {
+pub(crate) fn private_existing(path: &Path) -> Result<Dir> {
     let directory = Dir::absolute(path, false, false).map_err(|error| fail(error.message))?;
     require_private(&directory, path)?;
     Ok(directory)
 }
 
-fn config_text(config: &Config) -> Result<String> {
+pub(crate) fn config_text(config: &Config) -> Result<String> {
     let strategy = if config
         .strategy
         .bytes()
@@ -144,7 +144,7 @@ fn config_text(config: &Config) -> Result<String> {
     Ok(text)
 }
 
-fn rename_entry(directory: &Dir, old: &str, new: &str, replace: bool) -> Result<()> {
+pub(crate) fn rename_entry(directory: &Dir, old: &str, new: &str, replace: bool) -> Result<()> {
     let old = CString::new(old).map_err(|error| fail(error.to_string()))?;
     let new = CString::new(new).map_err(|error| fail(error.to_string()))?;
     let result = unsafe {
@@ -163,7 +163,7 @@ fn rename_entry(directory: &Dir, old: &str, new: &str, replace: bool) -> Result<
     directory.sync().map_err(|error| fail(error.message))
 }
 
-fn write_config(directory: &Dir, content: &[u8], replace: bool) -> Result<()> {
+pub(crate) fn write_config(directory: &Dir, content: &[u8], replace: bool) -> Result<()> {
     let temporary = format!(
         ".config-{}.tmp",
         service_fs::random_id().map_err(|e| fail(e.message))?

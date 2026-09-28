@@ -23,6 +23,8 @@ const BINS: [&str; 5] = [
     "ip6tables-legacy-save",
 ];
 const MB: u64 = 1024 * 1024;
+#[path = "service_transaction.rs"]
+mod transaction;
 pub struct Options<'a> {
     pub root: &'a str,
     pub values: BTreeMap<&'a str, &'a str>,
@@ -830,13 +832,39 @@ fn start_preflight() -> Result<()> {
     )
 }
 pub fn run(action: &str, o: &Options) -> Result<Value> {
+    run_checked(action, o, None)
+}
+pub fn apply_checked(o: &Options, expected_id: Option<&str>) -> Result<Value> {
+    run_checked("apply", o, expected_id)
+}
+pub fn with_paused_service(
+    allow_pause: bool,
+    operation: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    if unsafe { libc::getuid() } != 0 || service_fs::uid() != 0 {
+        return Err(AppError::new("permissions", "Требуются права root"));
+    }
+    let layout = Layout::open("/", false)?;
+    transaction::pause(&layout, allow_pause, operation)
+}
+fn run_checked(action: &str, o: &Options, expected_id: Option<&str>) -> Result<Value> {
     service_fs::path_ok(Path::new(o.root))?;
     // A noncanonical spelling of / is still real: never allow --root /. to
     // bypass privilege checks or send a rooted operation to the host manager.
     let root = Path::new(o.root).canonicalize().map_err(fail)?;
     let offline = root != Path::new("/");
     if offline
-        && (o.enable || o.start || !["install", "uninstall", "remove", "status"].contains(&action))
+        && (o.enable
+            || o.start
+            || ![
+                "install",
+                "apply",
+                "recover",
+                "uninstall",
+                "remove",
+                "status",
+            ]
+            .contains(&action))
     {
         return Err(AppError::new(
             "usage",
@@ -851,6 +879,24 @@ pub fn run(action: &str, o: &Options) -> Result<Value> {
     }
     let layout = Layout::open(o.root, offline)?;
     let manager = layout.manager()?;
+    if action == "recover" {
+        return transaction::recover(&layout, manager.as_ref());
+    }
+    if action != "status" {
+        transaction::require_idle(&layout)?;
+    }
+    if action == "apply" {
+        if let Some(id) = expected_id {
+            let (_, manifest) = verify_payload(&layout.opt, PAYLOAD)?;
+            if manifest["installation_id"] != id {
+                return Err(AppError::new(
+                    "installation_changed",
+                    "Установленная конфигурация изменилась. Откройте настройки заново",
+                ));
+            }
+        }
+        return transaction::apply(&layout, o, manager.as_ref());
+    }
     let exists = layout.opt.exists(PAYLOAD)?;
     if action == "install" {
         return install(&layout, o, manager.as_ref(), exists);

@@ -187,6 +187,23 @@ impl Managed {
 }
 
 pub fn capture(command: Command, input: &[u8], timeout: Duration) -> Result<Captured> {
+    capture_inner(command, input, timeout, None)
+}
+pub fn capture_interruptible(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+    signals: &crate::signals::Signals,
+) -> Result<Captured> {
+    signals.check()?;
+    capture_inner(command, input, timeout, Some(signals))
+}
+fn capture_inner(
+    command: Command,
+    input: &[u8],
+    timeout: Duration,
+    signals: Option<&crate::signals::Signals>,
+) -> Result<Captured> {
     let mut running = if input.is_empty() {
         Managed::spawn(command)?
     } else {
@@ -199,6 +216,12 @@ pub fn capture(command: Command, input: &[u8], timeout: Duration) -> Result<Capt
     let mut sent = 0;
     let start = Instant::now();
     let status = loop {
+        if let Some(signals) = signals
+            && let Err(e) = signals.check()
+        {
+            running.stop(Duration::from_millis(100))?;
+            return Err(e);
+        }
         running.drain()?;
         if sent == input.len() {
             stdin.take();

@@ -14,6 +14,7 @@ use std::{
 
 pub struct Manager {
     binary: PathBuf,
+    recovering: bool,
 }
 #[derive(Clone)]
 pub struct Status {
@@ -75,7 +76,10 @@ impl Manager {
                 use std::os::unix::fs::MetadataExt;
                 let m = file.metadata().map_err(service_fs::fail)?;
                 if m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0 && m.mode() & 0o111 != 0 {
-                    return Ok(Self { binary: path });
+                    return Ok(Self {
+                        binary: path,
+                        recovering: false,
+                    });
                 }
             }
         }
@@ -102,7 +106,7 @@ impl Manager {
             if running.poll()?.is_some() {
                 break running.stop(Duration::ZERO)?.0;
             }
-            if signals.requested().is_some() || started.elapsed() >= timeout {
+            if (!self.recovering && signals.requested().is_some()) || started.elapsed() >= timeout {
                 let reason = if signals.requested().is_some() {
                     "interrupted"
                 } else {
@@ -201,5 +205,14 @@ impl Manager {
             ));
         }
         Ok(after)
+    }
+    pub fn recovery(&self) -> Self {
+        Self {
+            binary: self.binary.clone(),
+            recovering: true,
+        }
+    }
+    pub fn control_for_recovery(&self, action: &str) -> Result<Status> {
+        self.recovery().control(action)
     }
 }

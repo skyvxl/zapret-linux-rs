@@ -14,6 +14,43 @@ use std::{
 
 thread_local! { static DASHBOARD: std::cell::RefCell<dashboard::Dashboard> = Default::default(); }
 thread_local! { static HUMAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static PROTOCOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+thread_local! { static RESULT: std::cell::RefCell<Value> = const { std::cell::RefCell::new(Value::Null) }; }
+thread_local! { static CLEANUP: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+thread_local! { static RESTORATION: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+pub struct Protocol(bool);
+impl Protocol {
+    pub fn enter() -> Self {
+        RESULT.with(|v| *v.borrow_mut() = Value::Null);
+        CLEANUP.set(None);
+        RESTORATION.set(None);
+        Self(PROTOCOL.replace(true))
+    }
+}
+impl Drop for Protocol {
+    fn drop(&mut self) {
+        PROTOCOL.set(self.0);
+    }
+}
+pub fn is_protocol() -> bool {
+    PROTOCOL.get()
+}
+pub fn record_cleanup(confirmed: bool) {
+    if is_protocol() {
+        CLEANUP.set(Some(confirmed));
+    }
+}
+pub fn action_result() -> (Value, Option<bool>) {
+    (RESULT.with(|v| v.borrow().clone()), CLEANUP.get())
+}
+pub fn record_restoration(confirmed: bool) {
+    if is_protocol() {
+        RESTORATION.set(Some(confirmed));
+    }
+}
+pub fn restoration() -> Option<bool> {
+    RESTORATION.get()
+}
 
 /// Explicit worker-only presentation; no environment-driven legacy changes.
 pub struct Human(bool);
@@ -32,7 +69,7 @@ pub fn is_human() -> bool {
     HUMAN.get()
 }
 
-fn render(value: &Value) -> String {
+pub fn render_event(value: &Value) -> String {
     if let Some(rendered) = DASHBOARD.with(|d| d.borrow_mut().update(value)) {
         return rendered;
     }
@@ -46,6 +83,9 @@ fn render(value: &Value) -> String {
         }
         _ => format!("{value}\n"),
     }
+}
+pub fn reset_dashboard() {
+    DASHBOARD.with(|d| *d.borrow_mut() = Default::default());
 }
 
 struct Flags {
@@ -63,11 +103,30 @@ impl Drop for Flags {
 }
 
 pub fn emit(value: Value, signals: &Signals, timeout: Duration, interruptible: bool) -> Result<()> {
+    if is_protocol() {
+        match value["event"].as_str() {
+            Some("diagnosis_complete") => {
+                RESULT.with(|v| *v.borrow_mut() = value["report"].clone())
+            }
+            Some("service_result") => RESULT.with(|v| *v.borrow_mut() = value.clone()),
+            _ => (),
+        }
+    }
     let stdout = io::stdout().lock();
     write(
         stdout.as_raw_fd(),
-        &if HUMAN.get() {
-            render(&value)
+        &if is_protocol() {
+            let (kind, payload) = if value["event"] == "ui_finished" {
+                ("finished", &value["outcome"])
+            } else {
+                ("progress", &value)
+            };
+            format!(
+                "{}\n",
+                serde_json::json!({"ui_version":1,"type":kind,"payload":payload})
+            )
+        } else if HUMAN.get() {
+            render_event(&value)
         } else {
             format!("{value}\n")
         },

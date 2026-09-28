@@ -18,6 +18,81 @@ use std::{
     process::Command,
 };
 pub const MANUAL_STATE: &str = "/var/lib/zapret-linux-rs-manual";
+pub enum Action {
+    Recover,
+    Run { allow_pause: bool },
+    Diagnose { allow_pause: bool },
+    Service(String),
+    Apply { expected_installation_id: String },
+}
+pub fn execute(
+    action: &Action,
+    inputs: Option<&crate::ui_model::PreparedInputs>,
+    on_event: &mut dyn FnMut(&serde_json::Value) -> Result<()>,
+) -> Result<crate::ui_model::ActionOutcome> {
+    output::reset_dashboard();
+    crate::ui_events::supervise(&mut command(action, inputs)?, on_event)
+}
+pub fn command(
+    action: &Action,
+    inputs: Option<&crate::ui_model::PreparedInputs>,
+) -> Result<Command> {
+    let mut args = vec!["ui".to_owned(), "worker".into(), "--events".into()];
+    if matches!(
+        action,
+        Action::Run { allow_pause: true } | Action::Diagnose { allow_pause: true }
+    ) {
+        args.push("--allow-pause".into());
+    }
+    if let Action::Apply {
+        expected_installation_id,
+    } = action
+    {
+        args.extend(["--expected-id".into(), expected_installation_id.clone()]);
+    }
+    if let Some(i) = inputs {
+        args.extend([
+            "--input-hashes".into(),
+            i.config_sha256.clone(),
+            i.bundle_sha256.clone(),
+        ]);
+    }
+    match action {
+        Action::Recover => args.push("recover".into()),
+        Action::Run { .. } => args.push("run".into()),
+        Action::Diagnose { .. } => args.push("diagnose".into()),
+        Action::Service(s) => args.extend(["service".into(), s.clone()]),
+        Action::Apply { .. } => args.extend(["service".into(), "apply".into()]),
+    }
+    if let Some(i) = inputs {
+        args.extend([path(&i.config)?.into(), path(&i.bundle)?.into()]);
+    }
+    let exe = std::env::current_exe().map_err(fail)?;
+    let mut command = if service_fs::uid() == 0 {
+        Command::new(exe)
+    } else {
+        let mut c = Command::new(tool("sudo")?);
+        if !ui_terminal::is_terminal() {
+            c.arg("-n");
+        }
+        c.arg("--").arg(exe);
+        c
+    };
+    command.args(args);
+    Ok(command)
+}
+pub fn apply(
+    inputs: &crate::ui_model::PreparedInputs,
+    expected_installation_id: &str,
+) -> Result<crate::ui_model::ActionOutcome> {
+    execute(
+        &Action::Apply {
+            expected_installation_id: expected_installation_id.into(),
+        },
+        Some(inputs),
+        &mut |_| Ok(()),
+    )
+}
 fn fail(message: impl ToString) -> AppError {
     AppError::new("ui", message.to_string())
 }
@@ -34,6 +109,8 @@ fn tool(name: &str) -> Result<PathBuf> {
 pub fn valid_service(action: &str) -> bool {
     [
         "install",
+        "apply",
+        "recover",
         "start",
         "stop",
         "restart",
@@ -54,7 +131,10 @@ pub fn launch(action: &str, service: Option<&str>) -> Result<()> {
     if let Some(s) = service {
         arguments.push(s.into());
     }
-    if action == "run" || action == "diagnose" || service == Some("install") {
+    if action == "run"
+        || action == "diagnose"
+        || service.is_some_and(|s| ["install", "apply"].contains(&s))
+    {
         let paths = AppPaths::discover()?;
         eprintln!("Проверка конфигурации и закреплённого набора данных...");
         let bundle = app_setup::setup(&paths, None)?;
@@ -135,20 +215,26 @@ fn manual_state() -> Result<(Dir, File)> {
 }
 fn recover(state: &Dir) -> Result<()> {
     let nft = tool("nft")?;
+    recover_with(state, &nft, false)
+}
+fn recover_with(state: &Dir, nft: &Path, quiet: bool) -> Result<()> {
     let result = state_cli::run(&[
         "recover",
         "--state-dir",
         MANUAL_STATE,
         "--nft",
-        path(&nft)?,
+        path(nft)?,
         "--allow-previous-boot",
     ])?;
     clean_recovered(state)?;
-    println!(
-        "Ручное состояние: {}; очистка: {}",
-        result["state"]["status"].as_str().unwrap_or("unknown"),
-        result["state"]["cleanup"].as_str().unwrap_or("unknown")
-    );
+    output::record_cleanup(true);
+    if !output::is_protocol() && !quiet {
+        println!(
+            "Ручное состояние: {}; очистка: {}",
+            result["state"]["status"].as_str().unwrap_or("unknown"),
+            result["state"]["cleanup"].as_str().unwrap_or("unknown")
+        );
+    }
     Ok(())
 }
 fn staged_paths(root: &Path) -> AppPaths {
@@ -377,6 +463,18 @@ fn source_args(paths: &AppPaths, bundle: &app_setup::Bundle) -> Result<Vec<Strin
     Ok(a)
 }
 pub fn worker(args: &[&str]) -> Result<()> {
+    worker_inner(args, None, false, None)
+}
+pub fn recover_for_service() -> Result<()> {
+    let (state, _lock) = manual_state()?;
+    recover_with(&state, Path::new("/opt/zapret-linux-rs/bin/nft"), true)
+}
+fn worker_inner(
+    args: &[&str],
+    expected_id: Option<&str>,
+    allow_pause: bool,
+    hashes: Option<(&str, &str)>,
+) -> Result<()> {
     if service_fs::uid() != 0 {
         return Err(AppError::new(
             "permissions",
@@ -387,8 +485,10 @@ pub fn worker(args: &[&str]) -> Result<()> {
         ["run", c, b] => ("run", None, Some((*c, *b))),
         ["diagnose", c, b] => ("diagnose", None, Some((*c, *b))),
         ["recover"] => ("recover", None, None),
-        ["service", "install", c, b] => ("service", Some("install"), Some((*c, *b))),
-        ["service", s] if valid_service(s) && *s != "install" => ("service", Some(*s), None),
+        ["service", s @ ("install" | "apply"), c, b] => ("service", Some(*s), Some((*c, *b))),
+        ["service", s] if valid_service(s) && !["install", "apply"].contains(s) => {
+            ("service", Some(*s), None)
+        }
         _ => {
             return Err(AppError::new(
                 "usage",
@@ -410,55 +510,88 @@ pub fn worker(args: &[&str]) -> Result<()> {
     }
     let (state, _lock) = manual_state()?;
     if action != "service" {
+        output::record_cleanup(false);
         recover(&state)?;
     }
     let Some((config, bundle)) = inputs else {
         return Ok(());
     };
-    let (name, paths, bundle) = snapshot(&state, Path::new(config), Path::new(bundle))?;
-    let result = (|| {
-        let mut args = source_args(&paths, &bundle)?;
-        if action == "service" {
-            args.insert(0, "install".into());
-            return show_service(service_cli::run(
-                &args.iter().map(String::as_str).collect::<Vec<_>>(),
-            )?);
-        }
-        args.extend(["--state-dir".into(), MANUAL_STATE.into()]);
-        if action == "run" {
-            args.insert(0, "--host".into());
-            lifecycle::run(&args.iter().map(String::as_str).collect::<Vec<_>>())
-        } else {
-            args.extend([
-                "--curl".into(),
-                path(&tool("curl")?)?.into(),
-                "--quic".into(),
-            ]);
-            println!(
-                "Диагностика всех {} стратегий. Выбранная конфигурация не изменится.",
-                bundle.strategy_count
+    let mut operation = || {
+        let (name, paths, bundle) = snapshot(&state, Path::new(config), Path::new(bundle))?;
+        let result = (|| {
+            if let Some((config_hash, bundle_hash)) = hashes
+                && (service_fs::digest(&service_fs::source(&paths.config_file, 65536, false)?)
+                    != config_hash
+                    || service_fs::digest(&bundle.manifest_bytes) != bundle_hash)
+            {
+                return Err(AppError::new(
+                    "inputs_changed",
+                    "Настройки или данные изменились до запуска. Откройте действие заново",
+                ));
+            }
+            let mut args = source_args(&paths, &bundle)?;
+            if action == "service" {
+                args.insert(0, service.unwrap().into());
+                return show_service(service_cli::run_with_expected(
+                    &args.iter().map(String::as_str).collect::<Vec<_>>(),
+                    expected_id,
+                )?);
+            }
+            args.extend(["--state-dir".into(), MANUAL_STATE.into()]);
+            if action == "run" {
+                output::record_cleanup(false);
+                args.insert(0, "--host".into());
+                lifecycle::run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            } else {
+                output::record_cleanup(false);
+                args.extend([
+                    "--curl".into(),
+                    path(&tool("curl")?)?.into(),
+                    "--quic".into(),
+                ]);
+                if !output::is_protocol() {
+                    println!(
+                        "Диагностика всех {} стратегий. Выбранная конфигурация не изменится.",
+                        bundle.strategy_count
+                    );
+                }
+                diagnose::run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            }
+        })();
+        let cleanup = (|| {
+            // Installation owns a separate immutable copy and its own journal.
+            let _lease = if action == "service" {
+                None
+            } else {
+                Some(empty_manual_state()?)
+            };
+            remove_snapshot(&state, &name)
+        })();
+        if cleanup.is_err() {
+            eprintln!(
+                "Не подтверждена очистка входных данных: {}. После устранения причины: ./service.sh recover",
+                paths.data_dir.display()
             );
-            diagnose::run(&args.iter().map(String::as_str).collect::<Vec<_>>())
         }
-    })();
-    let cleanup = (|| {
-        // Installation owns a separate immutable copy and its own journal.
-        let _lease = if action == "service" {
-            None
-        } else {
-            Some(empty_manual_state()?)
-        };
-        remove_snapshot(&state, &name)
-    })();
-    if cleanup.is_err() {
-        eprintln!(
-            "Не подтверждена очистка входных данных: {}. После устранения причины: ./service.sh recover",
-            paths.data_dir.display()
-        );
+        output::record_cleanup(cleanup.is_ok());
+        combine(result, cleanup)
+    };
+    if ["run", "diagnose"].contains(&action) && output::is_protocol() {
+        crate::service_install::with_paused_service(allow_pause, &mut operation)
+    } else {
+        operation()
     }
-    combine(result, cleanup)
 }
 fn show_service(value: serde_json::Value) -> Result<()> {
+    if output::is_protocol() {
+        let signals = crate::signals::Signals::install()?;
+        return output::emit(
+            serde_json::json!({"event":"service_result","service":value["service"]}),
+            &signals,
+            std::time::Duration::from_secs(5),
+            false,
+        );
+    }
     let s = &value["service"];
     println!(
         "Служба: {}. Состояние: {}. Автозапуск: {}.",
@@ -474,4 +607,82 @@ fn show_service(value: serde_json::Value) -> Result<()> {
         println!("Стратегия установленного снимка: {strategy}");
     }
     Ok(())
+}
+
+pub fn worker_events(args: &[&str]) -> Result<()> {
+    use crate::ui_model::{ActionOutcome, ActionStatus};
+    let _protocol = output::Protocol::enter();
+    let signals = crate::signals::Signals::install()?;
+    let (args, allow_pause) = if args.first() == Some(&"--allow-pause") {
+        (&args[1..], true)
+    } else {
+        (args, false)
+    };
+    let (args, expected_id) = if args.first() == Some(&"--expected-id") && args.len() > 2 {
+        (&args[2..], Some(args[1]))
+    } else {
+        (args, None)
+    };
+    let (args, hashes) = if args.first() == Some(&"--input-hashes") && args.len() > 3 {
+        (&args[3..], Some((args[1], args[2])))
+    } else {
+        (args, None)
+    };
+    output::emit(
+        serde_json::json!({"event":"worker_ready"}),
+        &signals,
+        std::time::Duration::from_secs(5),
+        false,
+    )?;
+    let result = worker_inner(args, expected_id, allow_pause, hashes);
+    if result.as_ref().err().is_some_and(|e| e.kind == "usage") {
+        return result;
+    }
+    let (data, cleanup) = output::action_result();
+    let recovery = result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.kind == "recovery_required");
+    let status = if cleanup == Some(false) || recovery {
+        ActionStatus::NeedsRecovery
+    } else {
+        match &result {
+            Ok(()) if signals.requested().is_some() => ActionStatus::Cancelled,
+            Ok(()) => ActionStatus::Completed,
+            Err(e) if e.kind == "interrupted" || e.message.contains("SIGINT") => {
+                ActionStatus::Cancelled
+            }
+            Err(_) => ActionStatus::Failed,
+        }
+    };
+    let outcome = ActionOutcome {
+        status,
+        data,
+        cleanup: match cleanup {
+            Some(true) => "confirmed",
+            Some(false) => "unknown",
+            None => "not_needed",
+        }
+        .into(),
+        restoration: if recovery {
+            "unknown"
+        } else if output::restoration() == Some(true) {
+            "restored"
+        } else if output::restoration() == Some(false) {
+            "unknown"
+        } else {
+            "not_needed"
+        }
+        .into(),
+        error: result.as_ref().err().map(|e| e.json()["error"].clone()),
+    };
+    crate::ui_events::emit_finished(&outcome, &signals)?;
+    match status {
+        ActionStatus::Completed => Ok(()),
+        ActionStatus::Cancelled => Err(AppError::new("cancelled", "Действие отменено")),
+        _ => Err(AppError::new(
+            "action",
+            "Действие не завершено; подробности переданы в меню",
+        )),
+    }
 }

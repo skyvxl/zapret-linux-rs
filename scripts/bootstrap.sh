@@ -91,6 +91,7 @@ inspect_dependencies() {
         add_missing "Rust/Cargo версии 1.88 или новее" cargo rustc
     fi
     have_any_command cc gcc clang || add_missing "компилятор и линкер C" build-essential
+    [[ ${1:-} == build ]] && return 0
     command -v curl >/dev/null 2>&1 || add_missing "curl" curl
     [[ -r /etc/ssl/certs/ca-certificates.crt ]] || add_missing "корневые сертификаты CA" ca-certificates
     command -v tar >/dev/null 2>&1 || add_missing "tar" tar
@@ -177,14 +178,18 @@ usage() {
 }
 
 case ${1:-} in
-    --check)
+    --check|--check-build)
         [[ $# == 1 ]] || { usage; exit 2; }
-        inspect_dependencies
+        inspect_dependencies "${1##*check-}"
         if ((${#MISSING[@]})); then
             print_missing
             exit 1
         fi
-        printf 'Системные зависимости готовы.\n'
+        if [[ $1 == --check-build ]]; then
+            printf 'Инструменты сборки готовы.\n'
+        else
+            printf 'Системные зависимости готовы.\n'
+        fi
         ;;
     --install)
         [[ $# == 1 ]] || { usage; exit 2; }

@@ -6,11 +6,16 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn run(args: &[&str]) -> Result<Value> {
+    run_with_expected(args, None)
+}
+pub fn run_with_expected(args: &[&str], expected_id: Option<&str>) -> Result<Value> {
     let Some((&action, args)) = args.split_first() else {
         return Err(AppError::new("usage", "service requires an action"));
     };
     if ![
         "install",
+        "apply",
+        "recover",
         "uninstall",
         "remove",
         "status",
@@ -59,7 +64,7 @@ pub fn run(args: &[&str]) -> Result<Value> {
         }
         i += 2;
     }
-    if (action != "install" && values.keys().any(|k| *k != "--root"))
+    if (!["install", "apply"].contains(&action) && values.keys().any(|k| *k != "--root"))
         || flags.iter().any(|f| match *f {
             "--stop" => !["remove", "uninstall"].contains(&action),
             _ => action != "install",
@@ -70,7 +75,7 @@ pub fn run(args: &[&str]) -> Result<Value> {
             "Option is not supported for this service action",
         ));
     }
-    if action == "install" {
+    if ["install", "apply"].contains(&action) {
         for key in [
             "--config",
             "--strategies",
@@ -92,5 +97,9 @@ pub fn run(args: &[&str]) -> Result<Value> {
         enable: flags.contains("--enable"),
         stop: flags.contains("--stop"),
     };
-    service_install::run(action, &options)
+    if action == "apply" {
+        service_install::apply_checked(&options, expected_id)
+    } else {
+        service_install::run(action, &options)
+    }
 }

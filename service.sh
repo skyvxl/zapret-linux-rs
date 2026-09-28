@@ -15,7 +15,7 @@ print_help() {
         '  ./service.sh КОМАНДА ...     передать команду интерфейсу Rust' \
         '  ./service.sh --help          показать эту справку' \
         '' \
-        'Обычные команды интерфейса: setup, update, run, diagnose, config, doctor, service, recover.'
+        'Обычные команды интерфейса: setup, update, run, diagnose, config, doctor, status, service, recover.'
 }
 
 die() {
@@ -121,6 +121,25 @@ canonicalize_absolute_path() {
     [[ $physical == / ]] && printf '/%s\n' "${tail#/}" || printf '%s%s\n' "$physical" "$tail"
 }
 
+case ${1:-} in
+    ''|--help|-h|menu|setup|update|run|diagnose|config|doctor|paths|status|recover|service|build|deps) ;;
+    *) printf 'Неизвестная команда. Справка: ./service.sh --help\n' >&2; exit 2 ;;
+esac
+for argument in "$@"; do
+    if [[ $argument == --help || $argument == -h ]]; then
+        print_help
+        printf '\nПример: ./service.sh %s\n' "${1:-menu}"
+        case ${1:-} in
+            service) printf 'Действия службы: install, start, stop, restart, enable, disable, status, apply, recover, remove.\napply заменяет настройки с сохранением режима работы и автозапуска.\nrecover восстанавливает прерванную операцию.\n' ;;
+            run) printf 'Запуск в терминале. Ctrl+C останавливает процесс и удаляет его правила.\n' ;;
+            diagnose) printf 'Проверка доступности сайтов для всех стратегий. Выбор результата доступен в меню.\n' ;;
+            config) printf 'Просмотр: ./service.sh config\nИзменить: ./service.sh config --strategy "general (ALT11).bat"\nСохранённые настройки не изменяют службу до service apply.\n' ;;
+            update) printf 'Загрузка стратегий и данных. Для службы затем выполните service apply.\n' ;;
+        esac
+        exit 0
+    fi
+done
+
 launcher=$(resolve_launcher "$0") || die "не удалось определить настоящий путь service.sh"
 project_dir=${launcher%/*}
 
@@ -151,13 +170,13 @@ if [[ ${1:-} == deps ]]; then
     esac
 fi
 
-if ! /bin/bash "$bootstrap" --check >&2; then
+if ! /bin/bash "$bootstrap" --check-build >&2; then
     if [[ -t 0 ]]; then
-        printf 'Подготовить недостающие зависимости сейчас? [y/N] ' >&2
+        printf 'Для открытия меню нужна подготовка.\n1. Установить недостающие зависимости\n0. Выход\nВыбор: ' >&2
         answer=
         IFS= read -r answer || answer=
         case $answer in
-            y|Y|yes|YES|да|Да|ДА)
+            1|y|Y|yes|YES|да|Да|ДА)
                 /bin/bash "$bootstrap" --install >&2 || exit $?
                 ;;
             *)
@@ -200,7 +219,7 @@ esac
 target_dir=$canonical_target
 
 build_command=(
-    "$cargo" build --locked
+    "$cargo" build --quiet --locked
     --manifest-path "$project_dir/Cargo.toml"
     --target-dir "$target_dir"
     --target "$host_target"

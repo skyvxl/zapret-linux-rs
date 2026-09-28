@@ -9,16 +9,15 @@ use std::{
     time::Duration,
 };
 
+#[path = "ui_terminal/menu.rs"]
+mod menu;
+pub use menu::{MenuItem, Selection, confirm, select};
+
 pub fn is_terminal() -> bool {
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
 fn supports_screen() -> bool {
     is_terminal() && std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb")
-}
-pub fn redraw() {
-    if supports_screen() {
-        print!("\x1b[2J\x1b[H\x1b[3J");
-    }
 }
 pub fn title(text: &str) {
     if supports_screen() && std::env::var_os("NO_COLOR").is_none() {
