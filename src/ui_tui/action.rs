@@ -34,6 +34,7 @@ impl App {
         let mut size = (0, 0);
         let mut text = "Подготовка к выполнению…".to_string();
         let mut events = Vec::new();
+        let mut table = diagnostic_table::DiagnosticTable::default();
         let mut stderr = String::new();
         loop {
             if status_job && started.elapsed() >= Duration::from_secs(5) && !timed_out {
@@ -56,6 +57,7 @@ impl App {
                 stderr.push_str(&line);
             }
             for v in update.events {
+                dirty |= table.update(&v);
                 if v["event"] == "worker_ready" {
                     ready = true;
                     self.session.resume()?;
@@ -69,6 +71,9 @@ impl App {
                             .unwrap_or("выбранная стратегия")
                     ),
                     "stopped" => "Процесс завершён. Проверяем очистку и восстановление.".into(),
+                    "strategy_started" => {
+                        format!("Подготовка: {}", v["strategy"].as_str().unwrap_or(""))
+                    }
                     "probe_started" => format!(
                         "Проверяем {}: {} ({})",
                         v["strategy"].as_str().unwrap_or(""),
@@ -94,15 +99,6 @@ impl App {
                     if events.len() < 4096 {
                         events.push(v.clone());
                     }
-                    text = diagnosis::progress(&events);
-                    dirty = true;
-                }
-                if v["event"] == "strategy_started" {
-                    text = format!(
-                        "Проверяем: {}\n\n{}",
-                        v["strategy"].as_str().unwrap_or(""),
-                        diagnosis::progress(&events)
-                    );
                     dirty = true;
                 }
                 if v["event"] == "running" {
@@ -151,12 +147,22 @@ impl App {
                         .terminal
                         .as_mut()
                         .unwrap()
-                        .draw(|f| view::operation(f, title, &text, cancelling, color))
+                        .draw(|f| {
+                            if table.started {
+                                table.draw(f, title, &text, true, cancelling, color);
+                            } else {
+                                view::operation(f, title, &text, cancelling, color);
+                            }
+                        })
                         .map_err(terminal::error)?;
                     dirty = false;
                 }
                 if event::poll(Duration::from_millis(30)).map_err(terminal::error)? {
-                    match event::read().map_err(terminal::error)? {
+                    let input = event::read().map_err(terminal::error)?;
+                    if table.started {
+                        dirty |= table.input(&input, false);
+                    }
+                    match input {
                         Event::Resize(_, _) => dirty = true,
                         Event::Key(k)
                             if k.kind != KeyEventKind::Release

@@ -34,6 +34,18 @@ impl App {
             Item::new("help", "Помощь и диагностика"),
         ]
     }
+    fn service_strategy_text(&self) -> String {
+        let status = &self.observer.value;
+        if let Some(strategy) = status["running_strategy"].as_str() {
+            format!("Работает с: {strategy}")
+        } else if let Some(strategy) = status["installed"]["strategy"].as_str() {
+            format!("Стратегия службы: {strategy}")
+        } else if status["state"] == "absent" {
+            "Стратегия службы: не установлена".into()
+        } else {
+            "Стратегия службы: нет данных".into()
+        }
+    }
     pub(super) fn home_text(&self) -> String {
         let s = &self.observer.value;
         let draft = ui_store::load_draft(&self.paths);
@@ -45,15 +57,9 @@ impl App {
             !s["installed"].is_null() && s["installed"]["config"] != d.config.json()
         });
         format!(
-            "Состояние: {}\nРаботает с: {}\nВыбрано: {}{}\nАвтозапуск: {}",
+            "Состояние: {}\n{}\nВыбрано: {}{}\nАвтозапуск: {}",
             s["label"].as_str().unwrap_or("Не удалось определить"),
-            s["running_strategy"]
-                .as_str()
-                .unwrap_or(if s["state"] == "running" {
-                    "не удалось определить"
-                } else {
-                    "запуск не подтверждён"
-                }),
+            self.service_strategy_text(),
             selected,
             if unapplied {
                 " (не применено)"
@@ -285,11 +291,9 @@ impl App {
         let Some(choice) = self.menu(
             "Сохранение настроек",
             &format!(
-                "Выбрано: {}\nРаботающая стратегия: {}",
+                "Выбрано: {}\n{}",
                 draft.config.strategy,
-                self.observer.value["running_strategy"]
-                    .as_str()
-                    .unwrap_or("нет")
+                self.service_strategy_text()
             ),
             &items,
             false,

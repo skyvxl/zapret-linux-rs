@@ -1,5 +1,6 @@
 mod action;
 mod diagnosis;
+mod diagnostic_table;
 mod flows;
 mod job;
 mod status;

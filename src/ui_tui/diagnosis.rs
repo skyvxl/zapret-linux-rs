@@ -7,51 +7,6 @@ fn targets() -> Result<Value> {
             .collect::<Vec<_>>()
     ))
 }
-fn transport(row: &Value, name: &str) -> &'static str {
-    if row["status"] == "not_run" {
-        return "Не проверена";
-    }
-    if row["status"] == "aborted" {
-        return "Стоп";
-    }
-    let checks: Vec<_> = row["checks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|c| c["transport"] == name && c["required"] == true)
-        .collect();
-    if checks.is_empty() {
-        return "н/д";
-    }
-    if checks.iter().all(|c| c["status"] == "unsupported") {
-        return "н/д";
-    }
-    if checks.iter().all(|c| c["status"] == "passed")
-        && row["status"] == "tested"
-        && row["cleanup_confirmed"] == true
-    {
-        "OK"
-    } else {
-        "Ошибка"
-    }
-}
-pub(super) fn progress(events: &[Value]) -> String {
-    let rows: Vec<_> = events
-        .iter()
-        .filter(|v| v["event"] == "strategy_complete")
-        .collect();
-    let mut text = format!("Проверено стратегий: {}\n\n", rows.len());
-    for v in rows.iter().rev().take(16).rev() {
-        let r = &v["result"];
-        text.push_str(&format!(
-            "{}  TCP: {}  QUIC: {}\n",
-            r["strategy"].as_str().unwrap_or(""),
-            transport(r, "tcp"),
-            transport(r, "quic")
-        ));
-    }
-    text
-}
 impl App {
     pub(super) fn strategies(&mut self) -> Result<()> {
         loop {
@@ -126,12 +81,54 @@ impl App {
             Ok(())
         }
     }
+    fn result_table(
+        &mut self,
+        table: &mut diagnostic_table::DiagnosticTable,
+        body: &str,
+    ) -> Result<Option<String>> {
+        let mut dirty = true;
+        let mut size = (0, 0);
+        loop {
+            self.check_exit()?;
+            self.observer.tick()?;
+            let now = crossterm::terminal::size().map_err(terminal::error)?;
+            if now != size {
+                size = now;
+                dirty = true;
+            }
+            if dirty {
+                let color = self.color;
+                let frame = self
+                    .session
+                    .terminal
+                    .as_mut()
+                    .unwrap()
+                    .draw(|f| table.draw(f, "Результаты подбора", body, false, false, color))
+                    .map_err(terminal::error)?;
+                self.background = Some(frame.buffer.clone());
+                dirty = false;
+            }
+            if !event::poll(Duration::from_millis(50)).map_err(terminal::error)? {
+                continue;
+            }
+            let input = event::read().map_err(terminal::error)?;
+            match &input {
+                Event::Resize(_, _) => dirty = true,
+                Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Err(AppError::new("ui_exit", "Выход"));
+                    }
+                    KeyCode::Enter if table.selected().is_some() => return Ok(table.selected()),
+                    _ => (),
+                },
+                _ => (),
+            }
+            dirty |= table.input(&input, true);
+        }
+    }
     fn results(&mut self, record: &ui_store::DiagnosisRecord) -> Result<()> {
         let passed = record.report["tcp_passed"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        let quic = record.report["quic_passed"]
             .as_array()
             .cloned()
             .unwrap_or_default();
@@ -140,47 +137,31 @@ impl App {
             .cloned()
             .unwrap_or_default();
         rows.sort_by_key(|r| !passed.contains(&r["strategy"]));
+        let mut table = diagnostic_table::DiagnosticTable::report(&record.report);
+        table.rows = rows.clone();
         loop {
             let draft = ui_store::load_draft(&self.paths)?;
             let fresh = app_setup::validate_bundle(&self.paths)
                 .and_then(|b| ui_store::fingerprint(&draft.config, &b.manifest_bytes, &targets()?))
                 .is_ok_and(|s| s == record.fingerprint);
             let body = format!(
-                "{}\nВидео и голосовую связь проверьте отдельно.",
+                "{}\n{}Видео и голосовую связь проверьте отдельно.",
                 if fresh {
                     "Последняя проверка"
                 } else {
                     "Устаревший отчёт. Рекомендуется повторить проверку."
+                },
+                if record.report["status"] == "aborted" {
+                    "Проверка прервана. "
+                } else {
+                    ""
                 }
             );
-            let items: Vec<_> = rows
-                .iter()
-                .map(|r| {
-                    Item::new(
-                        r["strategy"].as_str().unwrap_or(""),
-                        format!(
-                            "{}  TCP: {}  QUIC: {}",
-                            r["strategy"].as_str().unwrap_or(""),
-                            if passed.contains(&r["strategy"]) {
-                                "OK"
-                            } else {
-                                transport(r, "tcp")
-                            },
-                            if quic.contains(&r["strategy"]) {
-                                "OK"
-                            } else {
-                                transport(r, "quic")
-                            }
-                        ),
-                    )
-                })
-                .collect();
-            if items.is_empty() {
+            if rows.is_empty() {
                 self.notice = "Проверенных стратегий пока нет".into();
                 return Ok(());
             }
-            let Some(name) = self.menu("Результаты подбора", &body, &items, true)?
-            else {
+            let Some(name) = self.result_table(&mut table, &body)? else {
                 return Ok(());
             };
             let row = rows.iter().find(|r| r["strategy"] == name).unwrap();
