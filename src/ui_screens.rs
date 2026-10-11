@@ -420,6 +420,7 @@ pub fn run() -> Result<()> {
                 MenuItem::new("primary", first),
                 MenuItem::new("diagnose", "Подобрать стратегию"),
                 MenuItem::new("settings", "Настройки"),
+                MenuItem::new("lists", "Списки и ipset"),
                 MenuItem::new("update", "Обновление"),
                 MenuItem::new("help", "Помощь и диагностика"),
             ],
@@ -443,6 +444,7 @@ pub fn run() -> Result<()> {
             "primary" => start(&paths).and_then(|_| acknowledge()),
             "diagnose" => crate::ui_diagnostics::run(&paths),
             "settings" => crate::ui_settings::run(&paths),
+            "lists" => crate::ui_settings::lists(&paths).map(|_| Selection::Back),
             "update" => crate::ui_diagnostics::update(&paths),
             _ => crate::ui_diagnostics::help(&paths),
         };

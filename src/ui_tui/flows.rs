@@ -30,6 +30,7 @@ impl App {
             Item::new(id, label),
             Item::new("strategies", "Стратегии"),
             Item::new("settings", "Настройки"),
+            Item::new("lists", "Списки и ipset"),
             Item::new("update", "Обновление"),
             Item::new("help", "Помощь и диагностика"),
         ]
@@ -85,6 +86,7 @@ impl App {
                 "status" => self.refresh_status(),
                 "strategies" => self.strategies(),
                 "settings" => self.settings(),
+                "lists" => self.lists(),
                 "update" => self.update(),
                 _ => self.help(),
             };
@@ -497,6 +499,111 @@ impl App {
                     if self.choose(&mut draft)? {self.save(&mut draft)?;}
                 }
         }
+        Ok(())
+    }
+    pub(super) fn lists(&mut self) -> Result<()> {
+        loop {
+            let mode = crate::user_lists::load_ipset_mode(&self.paths)?;
+            let lines = |name: &str| {
+                crate::user_lists::read(&self.paths, name)
+                    .map(|b| {
+                        let text = String::from_utf8_lossy(&b);
+                        let nonempty = text.lines().filter(|l| !l.trim().is_empty()).count();
+                        nonempty
+                    })
+                    .unwrap_or(0)
+            };
+            let items = vec![
+                Item::new(
+                    "general",
+                    format!(
+                        "list-general-user.txt — свои домены (строк: {})",
+                        lines("list-general-user.txt")
+                    ),
+                ),
+                Item::new(
+                    "exclude",
+                    format!(
+                        "list-exclude-user.txt — исключить домены (строк: {})",
+                        lines("list-exclude-user.txt")
+                    ),
+                ),
+                Item::new(
+                    "ipset-exclude",
+                    format!(
+                        "ipset-exclude-user.txt — исключить IP/подсети (строк: {})",
+                        lines("ipset-exclude-user.txt")
+                    ),
+                ),
+                Item::new("ipset", format!("Режим ipset-all: {}", mode.label())),
+                Item::new(
+                    "ipset-custom",
+                    format!(
+                        "ipset-all.txt.custom — свой список ipset (строк: {})",
+                        lines(crate::user_lists::IPSET_CUSTOM)
+                    ),
+                ),
+            ];
+            let body = format!(
+                "Списки применяются при следующем запуске.\nТекущий режим ipset-all: {}",
+                mode.label()
+            );
+            let Some(choice) = self.menu("Списки и ipset", &body, &items, false)? else {
+                return Ok(());
+            };
+            let result = (|| {
+                match choice.as_str() {
+                    "general" => self.edit_list("list-general-user.txt")?,
+                    "exclude" => self.edit_list("list-exclude-user.txt")?,
+                    "ipset-exclude" => self.edit_list("ipset-exclude-user.txt")?,
+                    "ipset-custom" => self.edit_list(crate::user_lists::IPSET_CUSTOM)?,
+                    "ipset" => {
+                        let mode = crate::user_lists::load_ipset_mode(&self.paths)?;
+                        let modes = [
+                            crate::user_lists::IpsetMode::None,
+                            crate::user_lists::IpsetMode::Any,
+                            crate::user_lists::IpsetMode::Loaded,
+                            crate::user_lists::IpsetMode::Custom,
+                        ];
+                        let items: Vec<_> = modes
+                            .iter()
+                            .map(|m| {
+                                Item::new(
+                                    m.name(),
+                                    format!("{}{}", m.label(), if *m == mode { "  ✓" } else { "" }),
+                                )
+                            })
+                            .collect();
+                        if let Some(name) = self.menu(
+                            "Режим ipset-all",
+                            "Управляет файлом ipset-all.txt: каким IP-адресам разрешён обход.\nLoaded требует загруженного списка из архива (ipset-all.txt.backup).\nCustom берёт содержимое из ipset-all.txt.custom.",
+                            &items,
+                            false,
+                        )? {
+                            let selected = crate::user_lists::IpsetMode::parse(&name)
+                                .ok_or_else(|| AppError::new("lists", "Неизвестный режим"))?;
+                            crate::user_lists::save_ipset_mode(&self.paths, selected)?;
+                            self.notice = format!("Режим ipset-all: {}", selected.label());
+                        }
+                    }
+                    _ => (),
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.problem(e)?;
+            }
+        }
+    }
+    fn edit_list(&mut self, name: &str) -> Result<()> {
+        self.observer.stop();
+        self.session.suspend();
+        let result = crate::user_lists::edit(&self.paths, name);
+        self.session.resume()?;
+        self.signals.clear_interrupt();
+        self.observer.refresh();
+        result?;
+        self.notice = format!("{name} сохранён; применится при следующем запуске");
         Ok(())
     }
     fn recover(&mut self) -> Result<()> {

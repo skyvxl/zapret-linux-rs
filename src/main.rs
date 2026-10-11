@@ -46,6 +46,7 @@ mod ui_settings;
 mod ui_store;
 mod ui_terminal;
 mod ui_tui;
+mod user_lists;
 mod validation;
 
 use error::{AppError, Result};
