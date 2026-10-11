@@ -55,6 +55,7 @@ pub fn command(
             "--input-hashes".into(),
             i.config_sha256.clone(),
             i.bundle_sha256.clone(),
+            i.lists_sha256.clone(),
         ]);
     }
     match action {
@@ -250,10 +251,10 @@ const DIRS: &[&str] = &["bin", "strategies", "assets", "assets/bin", "assets/lis
 /// Revalidate the private root copy before executing any engine.
 fn snapshot(
     state: &Dir,
-    config: &Path,
+    config_path: &Path,
     source: &Path,
 ) -> Result<(String, AppPaths, app_setup::Bundle)> {
-    for p in [config, source] {
+    for p in [config_path, source] {
         service_fs::path_ok(p)?;
         if !p.is_absolute() {
             return Err(fail("Worker требует абсолютные входные пути"));
@@ -264,7 +265,7 @@ fn snapshot(
     stage.write("owner", name.as_bytes(), 0o600)?;
     let root = Path::new(MANUAL_STATE).join(&name);
     let result = (|| {
-        let bytes = service_fs::source(config, 64 * 1024, false)?;
+        let bytes = service_fs::source(config_path, 64 * 1024, false)?;
         let config = Config::parse(std::str::from_utf8(&bytes).map_err(fail)?)?;
         let manifest_bytes = service_fs::source(&source.join("manifest.json"), 1024 * 1024, false)?;
         let inventory = app_setup::checked_manifest(&manifest_bytes)?;
@@ -307,6 +308,8 @@ fn snapshot(
             )?;
         }
         let paths = staged_paths(&root);
+        let stage_inputs = config_path.parent().unwrap_or(Path::new(""));
+        crate::user_lists::overlay_from_stage(stage_inputs, &root)?;
         let bundle = app_setup::validate_bundle(&paths)?;
         Ok((paths, bundle))
     })();
@@ -473,7 +476,7 @@ fn worker_inner(
     args: &[&str],
     expected_id: Option<&str>,
     allow_pause: bool,
-    hashes: Option<(&str, &str)>,
+    hashes: Option<(&str, &str, &str)>,
 ) -> Result<()> {
     if service_fs::uid() != 0 {
         return Err(AppError::new(
@@ -482,10 +485,12 @@ fn worker_inner(
         ));
     }
     let (action, service, inputs) = match args {
-        ["run", c, b] => ("run", None, Some((*c, *b))),
-        ["diagnose", c, b] => ("diagnose", None, Some((*c, *b))),
+        ["run", c, b] => ("run", None, Some((*c, *b, None::<&str>))),
+        ["diagnose", c, b] => ("diagnose", None, Some((*c, *b, None::<&str>))),
         ["recover"] => ("recover", None, None),
-        ["service", s @ ("install" | "apply"), c, b] => ("service", Some(*s), Some((*c, *b))),
+        ["service", s @ ("install" | "apply"), c, b] => {
+            ("service", Some(*s), Some((*c, *b, None::<&str>)))
+        }
         ["service", s] if valid_service(s) && !["install", "apply"].contains(s) => {
             ("service", Some(*s), None)
         }
@@ -513,16 +518,19 @@ fn worker_inner(
         output::record_cleanup(false);
         recover(&state)?;
     }
-    let Some((config, bundle)) = inputs else {
+    let Some((config, bundle, _)) = inputs else {
         return Ok(());
     };
     let mut operation = || {
         let (name, paths, bundle) = snapshot(&state, Path::new(config), Path::new(bundle))?;
         let result = (|| {
-            if let Some((config_hash, bundle_hash)) = hashes
+            if let Some((config_hash, bundle_hash, lists_hash)) = hashes
                 && (service_fs::digest(&service_fs::source(&paths.config_file, 65536, false)?)
                     != config_hash
-                    || service_fs::digest(&bundle.manifest_bytes) != bundle_hash)
+                    || service_fs::digest(&bundle.manifest_bytes) != bundle_hash
+                    || crate::user_lists::staged_fingerprint(
+                        Path::new(config).parent().unwrap_or(Path::new("")),
+                    )? != lists_hash)
             {
                 return Err(AppError::new(
                     "inputs_changed",
@@ -623,8 +631,8 @@ pub fn worker_events(args: &[&str]) -> Result<()> {
     } else {
         (args, None)
     };
-    let (args, hashes) = if args.first() == Some(&"--input-hashes") && args.len() > 3 {
-        (&args[3..], Some((args[1], args[2])))
+    let (args, hashes) = if args.first() == Some(&"--input-hashes") && args.len() > 4 {
+        (&args[4..], Some((args[1], args[2], args[3])))
     } else {
         (args, None)
     };

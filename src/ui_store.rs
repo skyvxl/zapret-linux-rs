@@ -106,11 +106,29 @@ pub fn load_mode(paths: &AppPaths) -> Result<Option<RunMode>> {
 pub fn save_mode(paths: &AppPaths, mode: RunMode) -> Result<()> {
     paths.ensure_private_dirs()?;
     let _lock = app_setup::lock(paths)?;
-    load_mode(paths)?;
+    let mut value = load_ui(paths)?;
+    value["run_mode"] = json!(mode.name());
+    save_ui_locked(paths, &value)
+}
+/// The shared ui.json document (run mode, ipset mode). Missing keys are null.
+pub fn load_ui(paths: &AppPaths) -> Result<Value> {
+    let Some(bytes) = read(&paths.config_dir, "ui.json", 65536)? else {
+        return Ok(json!({"schema":1}));
+    };
+    let v: Value = serde_json::from_slice(&bytes).map_err(fail)?;
+    if v["schema"] != 1 {
+        return Err(fail("Неизвестный формат настроек меню"));
+    }
+    Ok(v)
+}
+pub(crate) fn save_ui_locked(paths: &AppPaths, value: &Value) -> Result<()> {
     atomic(
         &paths.config_dir,
         "ui.json",
-        &serde_json::to_vec(&json!({"schema":1,"run_mode":mode.name()})).map_err(fail)?,
+        &serde_json::to_vec(
+            &json!({"schema":1,"run_mode":value["run_mode"],"ipset_mode":value["ipset_mode"]}),
+        )
+        .map_err(fail)?,
         65536,
     )
 }
@@ -125,11 +143,34 @@ pub fn prepare_inputs(paths: &AppPaths, config: &Config) -> Result<PreparedInput
     let dir = app_paths::private_existing(&paths.cache_dir)?.mkdir(&name, 0o700)?;
     let bytes = app_paths::config_text(config)?.into_bytes();
     dir.write("config.env", &bytes, 0o600)?;
+    // Stage the user lists and the ipset mode next to the config so the root
+    // worker can apply them onto its snapshot without touching ~/.config.
+    let mode = crate::user_lists::load_ipset_mode(paths)?;
+    let mut fingerprint = format!("ipset={}\n", mode.name());
+    for name in crate::user_lists::USER_LISTS {
+        let bytes = crate::user_lists::read(paths, name)?;
+        fingerprint.push_str(&format!("{name}={}\n", digest(&bytes)));
+        dir.write(&format!("lists-{name}"), &bytes, 0o600)?;
+    }
+    let custom = crate::user_lists::read(paths, crate::user_lists::IPSET_CUSTOM)?;
+    fingerprint.push_str(&format!(
+        "{}={}\n",
+        crate::user_lists::IPSET_CUSTOM,
+        digest(&custom)
+    ));
+    dir.write(
+        &format!("lists-{}", crate::user_lists::IPSET_CUSTOM),
+        &custom,
+        0o600,
+    )?;
+    dir.write("ipset-mode", mode.name().as_bytes(), 0o600)?;
+    fingerprint.push_str(&format!("ipset={}\n", mode.name()));
     Ok(PreparedInputs {
-        config: paths.cache_dir.join(name).join("config.env"),
+        config: paths.cache_dir.join(&name).join("config.env"),
         bundle: bundle.root,
         config_sha256: digest(&bytes),
         bundle_sha256: digest(&bundle.manifest_bytes),
+        lists_sha256: digest(fingerprint.as_bytes()),
     })
 }
 pub fn remove_inputs(paths: &AppPaths, inputs: &PreparedInputs) -> Result<()> {
@@ -149,13 +190,21 @@ pub fn remove_inputs(paths: &AppPaths, inputs: &PreparedInputs) -> Result<()> {
         return Err(fail("Чужие временные настройки"));
     }
     let d = app_paths::private_existing(p)?;
-    if d.names()? != ["config.env"] {
+    let mut expected = vec!["config.env".to_string(), "ipset-mode".to_string()];
+    for n in crate::user_lists::USER_LISTS {
+        expected.push(format!("lists-{n}"));
+    }
+    expected.push(format!("lists-{}", crate::user_lists::IPSET_CUSTOM));
+    expected.sort();
+    if d.names()? != expected {
         return Err(fail("Изменились временные настройки"));
     }
     if digest(&d.read("config.env", 0o600, 65536)?) != inputs.config_sha256 {
         return Err(fail("Изменились временные настройки"));
     }
-    d.unlink("config.env", false)?;
+    for n in d.names()? {
+        d.unlink(&n, false)?;
+    }
     app_paths::private_existing(&paths.cache_dir)?.unlink(name, true)
 }
 pub struct DiagnosisRecord {

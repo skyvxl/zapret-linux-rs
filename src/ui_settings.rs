@@ -1,7 +1,7 @@
 use crate::{
     app_paths::AppPaths,
     app_setup,
-    error::Result,
+    error::{AppError, Result},
     service_status, ui_actions,
     ui_model::RuntimeState,
     ui_screens,
@@ -171,6 +171,7 @@ pub fn run(paths: &AppPaths) -> Result<Selection> {
                 "udp",
                 format!("GameFilter UDP: {}", switch(draft.config.gamefilterudp)),
             ),
+            MenuItem::new("lists", "Списки и ipset"),
             MenuItem::new("save", "Завершить редактирование"),
             MenuItem::new("trial", "Пробный запуск в терминале"),
         ];
@@ -183,6 +184,9 @@ pub fn run(paths: &AppPaths) -> Result<Selection> {
                 if ui_screens::acknowledge()? == Selection::Exit {
                     return Ok(Selection::Exit);
                 }
+            }
+            "lists" => {
+                lists(paths)?;
             }
             "strategy" => {
                 if choose_strategy(paths, &mut draft)? == Selection::Exit {
@@ -248,6 +252,105 @@ pub fn run(paths: &AppPaths) -> Result<Selection> {
             }
             "save" if finish_draft(paths, &draft)? => return ui_screens::acknowledge(),
             _ => (),
+        }
+    }
+}
+
+pub fn lists(paths: &AppPaths) -> Result<()> {
+    loop {
+        let mode = crate::user_lists::load_ipset_mode(paths)?;
+        let count = |name: &str| {
+            crate::user_lists::read(paths, name)
+                .map(|b| {
+                    String::from_utf8_lossy(&b)
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let heading = format!(
+            "СПИСКИ И IPSET\nРедактируемые списки применяются при следующем запуске.\nРежим ipset-all: {}\nКаталог: {}",
+            mode.label(),
+            crate::user_lists::dir(paths).display()
+        );
+        let choice = ui_terminal::select(
+            &heading,
+            &[
+                MenuItem::new(
+                    "general",
+                    format!(
+                        "list-general-user.txt — свои домены (строк: {})",
+                        count("list-general-user.txt")
+                    ),
+                ),
+                MenuItem::new(
+                    "exclude",
+                    format!(
+                        "list-exclude-user.txt — исключить домены (строк: {})",
+                        count("list-exclude-user.txt")
+                    ),
+                ),
+                MenuItem::new(
+                    "ipset-exclude",
+                    format!(
+                        "ipset-exclude-user.txt — исключить IP/подсети (строк: {})",
+                        count("ipset-exclude-user.txt")
+                    ),
+                ),
+                MenuItem::new("ipset", format!("Режим ipset-all: {}", mode.label())),
+                MenuItem::new(
+                    "ipset-custom",
+                    format!(
+                        "ipset-all.txt.custom — свой список ipset (строк: {})",
+                        count(crate::user_lists::IPSET_CUSTOM)
+                    ),
+                ),
+                MenuItem::new("back", "Вернуться в меню"),
+            ],
+            0,
+            false,
+        )?;
+        let Selection::Item(action) = choice else {
+            return Ok(());
+        };
+        match action.as_str() {
+            "general" => crate::user_lists::edit(paths, "list-general-user.txt")?,
+            "exclude" => crate::user_lists::edit(paths, "list-exclude-user.txt")?,
+            "ipset-exclude" => crate::user_lists::edit(paths, "ipset-exclude-user.txt")?,
+            "ipset-custom" => crate::user_lists::edit(paths, crate::user_lists::IPSET_CUSTOM)?,
+            "ipset" => {
+                let modes = [
+                    crate::user_lists::IpsetMode::None,
+                    crate::user_lists::IpsetMode::Any,
+                    crate::user_lists::IpsetMode::Loaded,
+                    crate::user_lists::IpsetMode::Custom,
+                ];
+                let items: Vec<_> = modes
+                    .iter()
+                    .map(|m| {
+                        let mut item =
+                            MenuItem::new(m.name(), format!("{} — {}", m.label(), m.detail()));
+                        item.detail = Some(m.detail().to_string());
+                        if *m == mode {
+                            item.detail = Some(format!("{} (текущий)", m.detail()));
+                        }
+                        item
+                    })
+                    .collect();
+                if let Selection::Item(name) =
+                    ui_terminal::select("Режим ipset-all", &items, 0, false)?
+                {
+                    let selected = crate::user_lists::IpsetMode::parse(&name)
+                        .ok_or_else(|| AppError::new("lists", "Неизвестный режим"))?;
+                    crate::user_lists::save_ipset_mode(paths, selected)?;
+                    println!(
+                        "Режим ipset-all: {}. Применится при следующем запуске.",
+                        selected.label()
+                    );
+                }
+            }
+            _ => return Ok(()),
         }
     }
 }

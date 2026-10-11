@@ -5,6 +5,7 @@ pub struct PreparedInputs {
     pub bundle: std::path::PathBuf,
     pub config_sha256: String,
     pub bundle_sha256: String,
+    pub lists_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

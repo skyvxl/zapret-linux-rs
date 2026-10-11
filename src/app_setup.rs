@@ -148,15 +148,6 @@ pub fn checked_manifest(bytes: &[u8]) -> Result<Vec<String>> {
             .as_u64()
             .filter(|n| *n <= limit)
             .ok_or_else(|| fail("Некорректный размер manifest"))?;
-        if GENERATED_LISTS
-            .iter()
-            .any(|name| path == format!("assets/lists/{name}"))
-            && (size != 0 || entry["sha256"] != digest(b""))
-        {
-            return Err(fail(
-                "Локальные пользовательские списки должны оставаться пустыми",
-            ));
-        }
         total += size;
         if total > app_flowseal::EXPANDED_LIMIT
             || !files.insert(path.to_string())
